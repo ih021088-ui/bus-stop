@@ -87,7 +87,6 @@ HOLIDAYS = {
     '2025_05_06',  # 어린이날 대체공휴일
     '2025_06_06',  # 현충일
     '2026_03_01',  # 삼일절
-    '2026_05_05',  # 어린이날
 }
 
 # ── 포화 임계값 ───────────────────────────────────────────────────
@@ -215,6 +214,19 @@ def build_dataset(data_dir='./해커톤데이터2'):
     # lag feature: 같은 정류장, 같은 방향, 같은 시간대 전날 탑승 수
     df = df.sort_values(['stop', 'direction', 'hour', 'date']).reset_index(drop=True)
     df['boardings_lag1'] = df.groupby(['stop', 'direction', 'hour'])['boardings'].shift(1)
+
+    # 날씨 데이터 merge
+    weather_path = os.path.join(os.path.dirname(data_dir) if data_dir != '.' else '.', 'weather.csv')
+    if not os.path.exists(weather_path):
+        weather_path = './weather.csv'
+    if os.path.exists(weather_path):
+        weather = pd.read_csv(weather_path)
+        weather_cols = ['date', 'temp_avg', 'precip_mm', 'is_rainy', 'is_cold', 'is_hot']
+        df = df.merge(weather[weather_cols], on='date', how='left')
+    else:
+        print('[경고] weather.csv 없음 — 날씨 피처가 NaN으로 채워집니다. collect_weather.py 먼저 실행하세요.')
+        for col in ['temp_avg', 'precip_mm', 'is_rainy', 'is_cold', 'is_hot']:
+            df[col] = float('nan')
 
     return df
 

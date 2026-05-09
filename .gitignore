@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+weather.csv
+preprocessed.csv
+models/
+*.pkl

@@ -55,8 +55,8 @@ print()
 # ── 정류장별 overflow 비율 계산 (train 데이터 기준) ───────────────
 def calc_overflow_ratio(train, stop):
     dep = train[(train['stop'] == stop) & (train['direction'] == 'depart')].copy()
-    dep = dep.sort_values('date').reset_index(drop=True)
-    dep['next_hour_board'] = dep.groupby('hour')['boardings'].shift(-1)
+    dep = dep.sort_values(['date', 'hour']).reset_index(drop=True)
+    dep['next_hour_board'] = dep.groupby('date')['boardings'].shift(-1)
 
     sat = dep[dep['boardings'] >= SAT_THRESH].copy()
     not_sat = dep[dep['boardings'] < SAT_THRESH].copy()
@@ -82,7 +82,7 @@ def train_model(train, test, stop, direction):
 
     if len(tr) < 10:
         print(f'  [{stop}] 학습 데이터 부족 ({len(tr)}개) - 스킵')
-        return None, None
+        return None, None, None
 
     X_tr, y_tr = tr[FEATURES], tr['boardings']
     X_te, y_te = te[FEATURES], te['boardings']
