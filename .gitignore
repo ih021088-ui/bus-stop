@@ -1,0 +1,4 @@
+해커톤데이터/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
