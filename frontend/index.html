@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>7790 버스 혼잡도</title>
+    <script src="https://oapi.map.naver.com/openapi/v3/maps.js?ncpKeyId=0puucmux88"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Noto Sans KR', Arial, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+
+        header {
+            background: #03C75A;
+            color: white;
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+        header h1 { font-size: 18px; font-weight: 700; }
+
+        .main { flex: 1; display: flex; overflow: hidden; }
+
+        #map { flex: 1; min-height: 0; height: 100%; }
+
+        .sidebar {
+            width: 300px;
+            background: #fff;
+            overflow-y: auto;
+            border-left: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+        }
+
+        .sidebar-header {
+            padding: 14px 16px;
+            border-bottom: 1px solid #e0e0e0;
+            background: #f8f9fa;
+        }
+        .sidebar-header label { font-size: 12px; color: #777; display: block; margin-bottom: 6px; }
+        .sidebar-header select {
+            width: 100%;
+            padding: 7px 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            background: #fff;
+        }
+
+        .section-label {
+            padding: 12px 16px 6px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #999;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+
+        .stop-card {
+            padding: 14px 16px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+        .stop-card:hover { background: #f5f5f5; }
+
+        .stop-name { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: #222; }
+
+        .stop-meta {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .boarding { font-size: 13px; color: #555; }
+        .boarding b { color: #222; }
+
+        .badge {
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .badge-여유 { background: #e8f5e9; color: #2e7d32; }
+        .badge-보통 { background: #fff3e0; color: #e65100; }
+        .badge-혼잡 { background: #ffebee; color: #c62828; }
+
+        .arrival-info {
+            margin-top: 6px;
+            font-size: 12px;
+            color: #1565c0;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .arrival-info.none { color: #aaa; }
+
+        .refresh-btn {
+            background: rgba(255,255,255,0.2);
+            border: 1px solid rgba(255,255,255,0.6);
+            color: white;
+            padding: 6px 14px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .refresh-btn:hover { background: rgba(255,255,255,0.35); }
+
+        #current-time { font-size: 13px; opacity: 0.9; }
+
+        .loading {
+            text-align: center;
+            padding: 30px;
+            color: #999;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>🚌 7790 버스 혼잡도</h1>
+    <div style="display:flex; align-items:center; gap:14px;">
+        <span id="current-time"></span>
+        <button class="refresh-btn" onclick="refreshData()">새로고침</button>
+    </div>
+</header>
+
+<div class="main">
+    <div id="map"></div>
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <label>시간대 선택</label>
+            <select id="hour-select" onchange="refreshData()">
+                <optgroup label="등교 방향 (사당→수원대)">
+                    <option value="7">07시</option>
+                    <option value="8">08시</option>
+                    <option value="9">09시</option>
+                    <option value="10">10시</option>
+                </optgroup>
+                <optgroup label="하교 방향 (수원대→사당)">
+                    <option value="13">13시</option>
+                    <option value="14">14시</option>
+                    <option value="15">15시</option>
+                    <option value="16">16시</option>
+                    <option value="17">17시</option>
+                    <option value="18">18시</option>
+                </optgroup>
+            </select>
+        </div>
+
+        <div class="section-label">하교 방향 (수원대 → 사당)</div>
+        <div id="depart-stops"><div class="loading">로딩 중...</div></div>
+
+        <div class="section-label">등교 방향 (사당 → 수원대)</div>
+        <div id="arrive-stops"><div class="loading">로딩 중...</div></div>
+    </div>
+</div>
+
+<script>
+// ── TAGO API 설정 ─────────────────────────────────────────────────────
+const TAGO_KEY = 'YOUR_SERVICE_KEY'; // data.go.kr에서 발급받은 키로 교체
+
+// ── 정류장 정보 ───────────────────────────────────────────────────────
+// nodeId: TAGO API 정류소 ID (아래 '정류소 ID 찾는 법' 참고)
+// cityCode: TAGO 도시 코드 (서울 11, 경기 각 시별 상이)
+const STOPS = {
+    depart: [
+        { name: '효행초등학교정문', lat: 37.2160, lng: 126.9691, cityCode: '', nodeId: '' },
+        { name: '아이파크정문',    lat: 37.2138, lng: 126.9707, cityCode: '', nodeId: '' },
+        { name: '신명아파트',      lat: 37.2136, lng: 126.9722, cityCode: '', nodeId: '' },
+        { name: '수원대입구',      lat: 37.2143, lng: 126.9779, cityCode: '', nodeId: '' },
+    ],
+    arrive: [
+        { name: '사당역9번출구앞', lat: 37.4776, lng: 126.9815, cityCode: '11', nodeId: '' },
+    ],
+};
+
+const CAP_1F = 45;
+const markers = {};
+const infoWindows = {};
+
+// ── 지도 초기화 ──────────────────────────────────────────────────────
+const map = new naver.maps.Map('map', {
+    center: new naver.maps.LatLng(37.37, 126.98),
+    zoom: 11,
+});
+
+// ── 혼잡도 판별 ──────────────────────────────────────────────────────
+function getCongestion(boardings) {
+    const ratio = boardings / CAP_1F;
+    if (ratio >= 0.8) return '혼잡';
+    if (ratio >= 0.5) return '보통';
+    return '여유';
+}
+
+function getColor(congestion) {
+    return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion];
+}
+
+// ── TAGO 도착정보 조회 ────────────────────────────────────────────────
+async function fetchArrivalForStop(stop) {
+    if (!stop.nodeId || !stop.cityCode || TAGO_KEY === 'YOUR_SERVICE_KEY') return null;
+
+    const url = `http://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList`
+        + `?serviceKey=${TAGO_KEY}&cityCode=${stop.cityCode}&nodeId=${stop.nodeId}&_type=json`;
+
+    try {
+        const res = await fetch(url);
+        const json = await res.json();
+        const raw = json?.response?.body?.items?.item;
+        if (!raw) return null;
+
+        const list = Array.isArray(raw) ? raw : [raw];
+        const buses = list
+            .filter(item => String(item.routeno).replace(/\s/g, '') === '7790')
+            .sort((a, b) => a.arrtime - b.arrtime);
+
+        if (buses.length === 0) return null;
+        return {
+            minutes: Math.ceil(buses[0].arrtime / 60),
+            prevStops: buses[0].arrprevstationcnt,
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function fetchAllArrivals() {
+    const all = [...STOPS.depart, ...STOPS.arrive];
+    const results = await Promise.all(all.map(s => fetchArrivalForStop(s)));
+    const map = {};
+    all.forEach((s, i) => { map[s.name] = results[i]; });
+    return map;
+}
+
+// ── 도착정보 텍스트 ───────────────────────────────────────────────────
+function arrivalText(info) {
+    if (!info) return null;
+    if (info.minutes <= 1) return '곧 도착';
+    return `${info.minutes}분 후 도착 (${info.prevStops}정류장 전)`;
+}
+
+// ── 마커 생성 ────────────────────────────────────────────────────────
+function createMarker(stop, boardings, arrival) {
+    const congestion = getCongestion(boardings);
+    const color = getColor(congestion);
+    const arrTxt = arrivalText(arrival);
+
+    if (markers[stop.name]) markers[stop.name].setMap(null);
+    if (infoWindows[stop.name]) infoWindows[stop.name].close();
+
+    const marker = new naver.maps.Marker({
+        position: new naver.maps.LatLng(stop.lat, stop.lng),
+        map,
+        icon: {
+            content: `
+                <div style="
+                    background:${color};
+                    color:#fff;
+                    padding:6px 12px;
+                    border-radius:20px;
+                    font-size:12px;
+                    font-weight:700;
+                    white-space:nowrap;
+                    box-shadow:0 2px 8px rgba(0,0,0,0.25);
+                    cursor:pointer;
+                    line-height:1.6;
+                    text-align:center;
+                ">
+                    ${stop.name}<br>
+                    <span style="font-size:11px;font-weight:400;">${boardings}명 · ${congestion}</span>
+                    ${arrTxt ? `<br><span style="font-size:10px;font-weight:400;opacity:0.9;">🕐 ${arrTxt}</span>` : ''}
+                </div>`,
+            anchor: new naver.maps.Point(60, 20),
+        },
+    });
+
+    const infoWindow = new naver.maps.InfoWindow({
+        content: `
+            <div style="padding:14px 16px; min-width:170px; font-family:Arial,sans-serif;">
+                <div style="font-weight:700; font-size:14px; margin-bottom:8px;">${stop.name}</div>
+                <div style="font-size:13px; color:#555;">예상 탑승: <b style="color:#222;">${boardings}명</b></div>
+                <div style="font-size:13px; margin-top:4px;">혼잡도: <b style="color:${color};">${congestion}</b></div>
+                ${arrTxt ? `<div style="font-size:12px; margin-top:6px; color:#1565c0;">🕐 ${arrTxt}</div>` : ''}
+            </div>`,
+        borderWidth: 1,
+        borderColor: '#ddd',
+    });
+
+    naver.maps.Event.addListener(marker, 'click', () => {
+        Object.values(infoWindows).forEach(iw => iw.close());
+        infoWindow.open(map, marker);
+    });
+
+    markers[stop.name] = marker;
+    infoWindows[stop.name] = infoWindow;
+}
+
+// ── 사이드바 카드 렌더링 ──────────────────────────────────────────────
+function renderCard(containerId, stop, boardings, arrival) {
+    const congestion = getCongestion(boardings);
+    const arrTxt = arrivalText(arrival);
+    const card = document.createElement('div');
+    card.className = 'stop-card';
+    card.innerHTML = `
+        <div class="stop-name">${stop.name}</div>
+        <div class="stop-meta">
+            <span class="boarding">예상 탑승 <b>${boardings}명</b></span>
+            <span class="badge badge-${congestion}">${congestion}</span>
+        </div>
+        <div class="arrival-info ${arrTxt ? '' : 'none'}">
+            ${arrTxt ? `🕐 ${arrTxt}` : '도착정보 없음'}
+        </div>`;
+
+    card.onclick = () => {
+        map.panTo(new naver.maps.LatLng(stop.lat, stop.lng));
+        map.setZoom(15, true);
+        Object.values(infoWindows).forEach(iw => iw.close());
+        infoWindows[stop.name]?.open(map, markers[stop.name]);
+    };
+
+    document.getElementById(containerId).appendChild(card);
+}
+
+// ── 혼잡도 데이터 로드 (mock → 추후 /predict API로 교체) ─────────────
+async function fetchData(hour) {
+    // TODO: server.py 완성 후 아래로 교체
+    // const res = await fetch(`/predict?hour=${hour}`);
+    // return await res.json();
+
+    return {
+        '효행초등학교정문': Math.floor(Math.random() * 28) + 10,
+        '아이파크정문':    Math.floor(Math.random() * 22) + 8,
+        '신명아파트':      Math.floor(Math.random() * 10) + 3,
+        '수원대입구':      Math.floor(Math.random() * 32) + 15,
+        '사당역9번출구앞': Math.floor(Math.random() * 35) + 10,
+    };
+}
+
+async function refreshData() {
+    const hour = parseInt(document.getElementById('hour-select').value);
+    const [data, arrivals] = await Promise.all([fetchData(hour), fetchAllArrivals()]);
+
+    document.getElementById('depart-stops').innerHTML = '';
+    document.getElementById('arrive-stops').innerHTML = '';
+
+    const isArrive = hour <= 10;
+
+    STOPS.depart.forEach(stop => {
+        const boardings = isArrive ? 0 : (data[stop.name] ?? 0);
+        createMarker(stop, boardings, arrivals[stop.name]);
+        renderCard('depart-stops', stop, boardings, arrivals[stop.name]);
+    });
+
+    STOPS.arrive.forEach(stop => {
+        const boardings = isArrive ? (data[stop.name] ?? 0) : 0;
+        createMarker(stop, boardings, arrivals[stop.name]);
+        renderCard('arrive-stops', stop, boardings, arrivals[stop.name]);
+    });
+}
+
+// ── 현재 시각 표시 ────────────────────────────────────────────────────
+function updateTime() {
+    document.getElementById('current-time').textContent =
+        new Date().toLocaleString('ko-KR', {
+            month: 'long', day: 'numeric',
+            weekday: 'short', hour: '2-digit', minute: '2-digit',
+        });
+}
+
+// ── 현재 시간과 가장 가까운 시간대 자동 선택 ─────────────────────────
+function setDefaultHour() {
+    const h = new Date().getHours();
+    const valid = [7, 8, 9, 10, 13, 14, 15, 16, 17, 18];
+    const closest = valid.reduce((a, b) => Math.abs(b - h) < Math.abs(a - h) ? b : a);
+    document.getElementById('hour-select').value = closest;
+}
+
+// ── 도착정보 30초마다 자동 갱신 ──────────────────────────────────────
+setInterval(refreshData, 30000);
+
+// ── 초기 실행 ─────────────────────────────────────────────────────────
+setDefaultHour();
+updateTime();
+setInterval(updateTime, 60000);
+refreshData();
+</script>
+</body>
+</html>
