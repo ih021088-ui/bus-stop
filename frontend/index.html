@@ -160,7 +160,9 @@
 
 <script>
 // ── API 설정 ──────────────────────────────────────────────────────────
-const GBIS_KEY = 'YOUR_SERVICE_KEY'; // 경기도버스도착정보조회서비스 키
+// server.py와 같은 origin에서 서빙되면 '' 그대로 사용
+// 로컬에서 파일 직접 열 경우: 'http://localhost:8000'
+const API_BASE = window.location.protocol === 'file:' ? 'http://localhost:8000' : '';
 
 // ── 정류장 정보 ───────────────────────────────────────────────────────
 const STOPS = {
@@ -197,42 +199,24 @@ function getColor(congestion) {
     return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion];
 }
 
-// ── GBIS 도착정보 조회 (경기도) ───────────────────────────────────────
-async function fetchGbisArrival(stop) {
-    if (!GBIS_KEY || GBIS_KEY === 'YOUR_SERVICE_KEY') return null;
-
-    const url = `https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2`
-        + `?serviceKey=${GBIS_KEY}&stationId=${stop.stationId}`;
-
-    try {
-        const res = await fetch(url);
-        const json = await res.json();
-        const list = json?.response?.msgBody?.busArrivalList;
-        if (!list) return null;
-
-        const bus = list.find(item => String(item.routeName) === '7790');
-        if (!bus || !bus.predictTime1) return null;
-        const seats = parseInt(bus.remainSeatCnt1);
-        return {
-            minutes: parseInt(bus.predictTime1),
-            seats: seats > 0 ? seats : null,
-        };
-    } catch {
-        return null;
-    }
-}
-
 // ── API 호출 ──────────────────────────────────────────────────────────
-async function fetchArrivalForStop(stop) {
-    return fetchGbisArrival(stop);
-}
-
 async function fetchAllArrivals() {
-    const all = [...STOPS.depart, ...STOPS.arrive];
-    const results = await Promise.all(all.map(s => fetchArrivalForStop(s)));
-    const map = {};
-    all.forEach((s, i) => { map[s.name] = results[i]; });
-    return map;
+    try {
+        const res = await fetch(`${API_BASE}/arrival`);
+        const raw = await res.json();
+        // server.py returns { stopName: {plateNo, busType, capacity, remainSeat, passengers, predictMin} }
+        const result = {};
+        for (const [name, info] of Object.entries(raw)) {
+            if (!info) { result[name] = null; continue; }
+            result[name] = {
+                minutes: info.predictMin,
+                seats: info.remainSeat,
+            };
+        }
+        return result;
+    } catch {
+        return {};
+    }
 }
 
 // ── 도착정보 텍스트 ───────────────────────────────────────────────────
@@ -244,8 +228,8 @@ function arrivalText(info) {
 }
 
 // ── 마커 생성 ────────────────────────────────────────────────────────
-function createMarker(stop, boardings, arrival) {
-    const congestion = getCongestion(boardings);
+function createMarker(stop, boardings, status, arrival) {
+    const congestion = status || getCongestion(boardings);
     const color = getColor(congestion);
     const arrTxt = arrivalText(arrival);
 
@@ -300,8 +284,8 @@ function createMarker(stop, boardings, arrival) {
 }
 
 // ── 사이드바 카드 렌더링 ──────────────────────────────────────────────
-function renderCard(containerId, stop, boardings, arrival) {
-    const congestion = getCongestion(boardings);
+function renderCard(containerId, stop, boardings, status, arrival) {
+    const congestion = status || getCongestion(boardings);
     const arrTxt = arrivalText(arrival);
     const card = document.createElement('div');
     card.className = 'stop-card';
@@ -325,19 +309,19 @@ function renderCard(containerId, stop, boardings, arrival) {
     document.getElementById(containerId).appendChild(card);
 }
 
-// ── 혼잡도 데이터 로드 (mock → 추후 /predict API로 교체) ─────────────
+// ── 혼잡도 데이터 로드 (/predict API) ────────────────────────────────
 async function fetchData(hour) {
-    // TODO: server.py 완성 후 아래로 교체
-    // const res = await fetch(`/predict?hour=${hour}`);
-    // return await res.json();
-
-    return {
-        '효행초등학교정문': Math.floor(Math.random() * 28) + 10,
-        '아이파크정문':    Math.floor(Math.random() * 22) + 8,
-        '신명아파트':      Math.floor(Math.random() * 10) + 3,
-        '수원대입구':      Math.floor(Math.random() * 32) + 15,
-        '사당역9번출구앞': Math.floor(Math.random() * 35) + 10,
-    };
+    try {
+        const res = await fetch(`${API_BASE}/predict?hour=${hour}`);
+        const json = await res.json();
+        const result = {};
+        for (const s of (json.stops || [])) {
+            result[s.stop] = { predicted: s.predicted, status: s.status, capacity: s.capacity };
+        }
+        return result;
+    } catch {
+        return {};
+    }
 }
 
 async function refreshData() {
@@ -350,15 +334,19 @@ async function refreshData() {
     const isArrive = hour <= 10;
 
     STOPS.depart.forEach(stop => {
-        const boardings = isArrive ? 0 : (data[stop.name] ?? 0);
-        createMarker(stop, boardings, arrivals[stop.name]);
-        renderCard('depart-stops', stop, boardings, arrivals[stop.name]);
+        const info = isArrive ? null : (data[stop.name] ?? null);
+        const boardings = info ? info.predicted : 0;
+        const status = info ? info.status : '여유';
+        createMarker(stop, boardings, status, arrivals[stop.name]);
+        renderCard('depart-stops', stop, boardings, status, arrivals[stop.name]);
     });
 
     STOPS.arrive.forEach(stop => {
-        const boardings = isArrive ? (data[stop.name] ?? 0) : 0;
-        createMarker(stop, boardings, arrivals[stop.name]);
-        renderCard('arrive-stops', stop, boardings, arrivals[stop.name]);
+        const info = isArrive ? (data[stop.name] ?? null) : null;
+        const boardings = info ? info.predicted : 0;
+        const status = info ? info.status : '여유';
+        createMarker(stop, boardings, status, arrivals[stop.name]);
+        renderCard('arrive-stops', stop, boardings, status, arrivals[stop.name]);
     });
 }
 
