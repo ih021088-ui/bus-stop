@@ -2,241 +2,317 @@
 7790 버스 혼잡도 예측 API
 GET /predict?hour=15
 GET /predict?hour=15&date=2026-05-13
+GET /arrival          → 모든 정류장의 실시간 도착정보
+GET /health
 """
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import numpy as np
+import os
 import pickle
-import httpx
-from datetime import date, timedelta
-from pathlib import Path
+import requests
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from urllib.parse import unquote
 
-app = FastAPI(title="7790 버스 혼잡도 예측 API")
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
+# ── 설정 ──────────────────────────────────────────────────────────────────
+API_KEY   = unquote(os.environ.get(
+    'PUBLIC_DATA_API_KEY',
+    'J1NNfn5UJ4zegGKBELL2lGTySAkSdNuFdugnZ0Pf5/e2OsLWJOSJOEeSiQObz15Ns1opof3iEqWhwbhTAg5U4A=='
+))
+GBIS_URL  = 'https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2'
+ROUTE_ID  = 200000149   # 7790 경기버스
 
-# ── 정류장 정의 ───────────────────────────────────────────────────
 DEPART_STOPS = ['효행초등학교정문', '아이파크정문', '신명아파트', '수원대입구']
 ARRIVE_STOP  = '사당역9번출구앞'
-CAPACITY     = 45   # 혼잡도 표시 기준 (1층 버스)
+ALL_STOPS    = DEPART_STOPS + [ARRIVE_STOP]
 
-# ── 학사 일정 (하드코딩) ──────────────────────────────────────────
-# 2026 1학기: 3/4(수) 개강, 6/26 종강
-SEM_2026_1_START  = date(2026, 3, 2)   # 주차 계산 기준 (개강 직전 일요일)
-EXAM_MID_2026_1   = (date(2026, 4, 16), date(2026, 4, 30))
-EXAM_FIN_2026_1   = (date(2026, 6,  4), date(2026, 6, 17))
-PRE_MID_2026_1    = (date(2026, 4,  6), date(2026, 4, 10))
-PRE_FIN_2026_1    = (date(2026, 5, 28), date(2026, 6,  3))
-SEM_2026_1_END    = date(2026, 6, 26)
-
-HOLIDAYS_2026 = {
-    date(2026, 5,  5),   # 어린이날
-    date(2026, 6,  6),   # 현충일 (토요일이지만 혹시 대체)
+STATION_IDS = {
+    '효행초등학교정문': '233002245',
+    '아이파크정문':     '233002371',
+    '신명아파트':       '233002255',
+    '수원대입구':       '233003021',
+    '사당역9번출구앞':  '119000302',
 }
+CAPACITY = {0: 45, 1: 45, 2: 70}   # lowPlate → 정원
 
-# ── 모델 로드 ─────────────────────────────────────────────────────
-MODEL_DIR = Path("./models")
+FEATURES = [
+    'hour', 'weekday', 'week_num', 'sem_num',
+    'is_exam', 'is_exam_mid', 'is_exam_fin', 'is_pre_exam', 'is_holiday',
+    'boardings_lag1',
+    'temp_avg', 'precip_mm', 'is_rainy', 'is_cold', 'is_hot',
+]
 
-def load_models():
-    models = {}
-    for stop in DEPART_STOPS + [ARRIVE_STOP]:
-        path = MODEL_DIR / f"model_{stop}.pkl"
-        with open(path, "rb") as f:
-            models[stop] = pickle.load(f)
-    with open(MODEL_DIR / "overflow_map.pkl", "rb") as f:
-        overflow_map = pickle.load(f)
-    return models, overflow_map
+# ── 앱 초기화 ─────────────────────────────────────────────────────────────
+app = FastAPI(title='7790 버스 예측 API')
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['*'],
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
 
-models, overflow_map = load_models()
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), 'frontend')
+if os.path.isdir(FRONTEND_DIR):
+    app.mount('/static', StaticFiles(directory=FRONTEND_DIR), name='static')
 
-# ── 데이터 로드 ───────────────────────────────────────────────────
-df_hist    = pd.read_csv("./preprocessed.csv")
-df_weather = pd.read_csv("./weather.csv")
+@app.get('/')
+def root():
+    index = os.path.join(FRONTEND_DIR, 'index.html')
+    if os.path.exists(index):
+        return FileResponse(index)
+    return {'status': 'ok'}
 
-# ── 학사 피처 계산 ────────────────────────────────────────────────
-def get_academic_features(target: date) -> dict:
-    in_sem = date(2026, 3, 4) <= target <= SEM_2026_1_END
-    if not in_sem:
-        return {
-            "week_num": 1, "sem_num": 1,
-            "is_exam": 0, "is_exam_mid": 0, "is_exam_fin": 0,
-            "is_pre_exam": 0,
-        }
+# ── 모델 & 데이터 로드 ────────────────────────────────────────────────────
+MODEL_DIR = './models'
+models: dict = {}
+history: pd.DataFrame | None = None
 
-    week_num = (target - SEM_2026_1_START).days // 7 + 1
+def load_resources():
+    global models, history
+    for stop in ALL_STOPS:
+        path = os.path.join(MODEL_DIR, f'model_{stop}.pkl')
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                models[stop] = pickle.load(f)
+    if os.path.exists('./preprocessed.csv'):
+        history = pd.read_csv('./preprocessed.csv')
+        history.columns = [c.lstrip('\ufeff') for c in history.columns]
 
-    in_mid = EXAM_MID_2026_1[0] <= target <= EXAM_MID_2026_1[1]
-    in_fin = EXAM_FIN_2026_1[0] <= target <= EXAM_FIN_2026_1[1]
-    in_pre_mid = PRE_MID_2026_1[0] <= target <= PRE_MID_2026_1[1]
-    in_pre_fin = PRE_FIN_2026_1[0] <= target <= PRE_FIN_2026_1[1]
+load_resources()
 
+# ── 학사 캘린더 ───────────────────────────────────────────────────────────
+WEEK_MAP: dict = {}
+SEM_MAP:  dict = {}
+MIDTERM_SET: set = set()
+FINAL_SET:   set = set()
+HOLIDAYS = {'2025_03_01','2025_05_05','2025_05_06','2025_06_06','2026_03_01','2026_05_05'}
+
+def _build_calendar():
+    week_entries = [
+        ('2025-03-04','2025-03-07','2025_1',1),('2025-03-10','2025-03-14','2025_1',2),
+        ('2025-03-17','2025-03-21','2025_1',3),('2025-03-24','2025-03-28','2025_1',4),
+        ('2025-03-31','2025-04-04','2025_1',5),('2025-04-07','2025-04-11','2025_1',6),
+        ('2025-04-14','2025-04-18','2025_1',7),('2025-04-21','2025-04-25','2025_1',8),
+        ('2025-04-28','2025-05-02','2025_1',9),('2025-05-05','2025-05-09','2025_1',10),
+        ('2025-05-12','2025-05-16','2025_1',11),('2025-05-19','2025-05-23','2025_1',12),
+        ('2025-05-26','2025-05-30','2025_1',13),('2025-06-02','2025-06-06','2025_1',14),
+        ('2025-06-09','2025-06-13','2025_1',15),('2025-06-16','2025-06-20','2025_1',16),
+        ('2025-06-23','2025-06-27','2025_1',17),
+        ('2025-08-25','2025-08-29','2025_2',1),('2025-09-01','2025-09-05','2025_2',2),
+        ('2025-09-08','2025-09-12','2025_2',3),
+        ('2026-03-04','2026-03-06','2026_1',1),('2026-03-09','2026-03-13','2026_1',2),
+        ('2026-03-16','2026-03-20','2026_1',3),('2026-03-23','2026-03-27','2026_1',4),
+        ('2026-03-30','2026-04-03','2026_1',5),('2026-04-06','2026-04-10','2026_1',6),
+        ('2026-04-13','2026-04-17','2026_1',7),('2026-04-20','2026-04-24','2026_1',8),
+        ('2026-04-27','2026-05-01','2026_1',9),('2026-05-04','2026-05-08','2026_1',10),
+        ('2026-05-11','2026-05-15','2026_1',11),('2026-05-18','2026-05-22','2026_1',12),
+        ('2026-05-25','2026-05-29','2026_1',13),('2026-06-01','2026-06-05','2026_1',14),
+        ('2026-06-08','2026-06-12','2026_1',15),('2026-06-15','2026-06-19','2026_1',16),
+    ]
+    for s, e, sem, wk in week_entries:
+        d = datetime.strptime(s, '%Y-%m-%d')
+        end = datetime.strptime(e, '%Y-%m-%d')
+        while d <= end:
+            key = d.strftime('%Y_%m_%d')
+            WEEK_MAP[key] = wk
+            SEM_MAP[key]  = sem
+            d += timedelta(days=1)
+
+    def dr(s, e):
+        d, end, res = datetime.strptime(s,'%Y-%m-%d'), datetime.strptime(e,'%Y-%m-%d'), set()
+        while d <= end:
+            res.add(d.strftime('%Y_%m_%d')); d += timedelta(days=1)
+        return res
+
+    MIDTERM_SET.update(dr('2025-04-16','2025-04-30') | dr('2026-04-16','2026-04-30'))
+    FINAL_SET.update(dr('2025-06-04','2025-06-17'))
+
+_build_calendar()
+
+PRE_EXAM_WEEKS = {('2025_1',6),('2026_1',6),('2025_1',13)}
+
+def get_calendar_features(dt: datetime) -> dict:
+    key      = dt.strftime('%Y_%m_%d')
+    sem      = SEM_MAP.get(key, 'unknown')
+    week_num = WEEK_MAP.get(key, -1)
+    sem_num  = int(sem.split('_')[1]) if sem != 'unknown' else -1
+    is_mid   = int(key in MIDTERM_SET)
+    is_fin   = int(key in FINAL_SET)
     return {
-        "week_num":    min(week_num, 17),
-        "sem_num":     1,
-        "is_exam":     int(in_mid or in_fin),
-        "is_exam_mid": int(in_mid),
-        "is_exam_fin": int(in_fin),
-        "is_pre_exam": int(in_pre_mid or in_pre_fin),
+        'week_num':    week_num,
+        'sem_num':     sem_num,
+        'is_exam':     int(is_mid or is_fin),
+        'is_exam_mid': is_mid,
+        'is_exam_fin': is_fin,
+        'is_pre_exam': int((sem, week_num) in PRE_EXAM_WEEKS),
+        'is_holiday':  int(key in HOLIDAYS),
     }
 
-# ── 날씨 피처 ────────────────────────────────────────────────────
-def get_weather_features(target: date) -> dict:
-    date_key = target.strftime("%Y_%m_%d")
-    row = df_weather[df_weather["date"] == date_key]
-    if row.empty:
-        # 없으면 최근 7일 평균
-        row = df_weather.tail(7)
+# ── 날씨 조회 (Open-Meteo forecast) ──────────────────────────────────────
+def get_weather(dt: datetime) -> dict:
+    date_str = dt.strftime('%Y-%m-%d')
+    try:
+        r = requests.get('https://api.open-meteo.com/v1/forecast', params={
+            'latitude': 37.27, 'longitude': 126.99,
+            'daily': 'temperature_2m_max,temperature_2m_min,precipitation_sum',
+            'timezone': 'Asia/Seoul',
+            'start_date': date_str, 'end_date': date_str,
+        }, timeout=8)
+        d = r.json()['daily']
+        t_max = d['temperature_2m_max'][0] or 15
+        t_min = d['temperature_2m_min'][0] or 10
+        precip = d['precipitation_sum'][0] or 0
+        t_avg = (t_max + t_min) / 2
         return {
-            "temp_avg":  round(row["temp_avg"].mean(), 1),
-            "precip_mm": round(row["precip_mm"].mean(), 1),
-            "is_rainy":  int(row["precip_mm"].mean() > 0.5),
-            "is_cold":   int(row["temp_avg"].mean() < 5),
-            "is_hot":    int(row["temp_avg"].mean() > 28),
+            'temp_avg':  round(t_avg, 1),
+            'precip_mm': round(precip, 1),
+            'is_rainy':  int(precip > 0.5),
+            'is_cold':   int(t_avg < 5),
+            'is_hot':    int(t_avg > 28),
         }
-    r = row.iloc[0]
-    return {
-        "temp_avg":  float(r["temp_avg"]),
-        "precip_mm": float(r["precip_mm"]),
-        "is_rainy":  int(r["is_rainy"]),
-        "is_cold":   int(r["is_cold"]),
-        "is_hot":    int(r["is_hot"]),
-    }
+    except Exception:
+        return {'temp_avg': 15.0, 'precip_mm': 0.0, 'is_rainy': 0, 'is_cold': 0, 'is_hot': 0}
 
-# ── lag1 (전날 같은 시간 탑승 수) ────────────────────────────────
-def get_lag1(stop: str, direction: str, hour: int, target: date) -> float:
-    yesterday = (target - timedelta(days=1)).strftime("%Y_%m_%d")
-    row = df_hist[
-        (df_hist["stop"] == stop) &
-        (df_hist["direction"] == direction) &
-        (df_hist["hour"] == hour) &
-        (df_hist["date"] == yesterday)
+# ── 전날 탑승 인원 (lag1) ────────────────────────────────────────────────
+def get_lag1(stop: str, hour: int, dt: datetime) -> float:
+    if history is None:
+        return 0.0
+    yesterday = (dt - timedelta(days=1)).strftime('%Y_%m_%d')
+    rows = history[
+        (history['stop'] == stop) &
+        (history['hour'] == hour) &
+        (history['date'] == yesterday)
     ]
-    if not row.empty:
-        return float(row.iloc[0]["boardings"])
-    # 없으면 같은 요일 + 같은 시간 최근 4주 평균
-    recent = df_hist[
-        (df_hist["stop"] == stop) &
-        (df_hist["direction"] == direction) &
-        (df_hist["hour"] == hour) &
-        (df_hist["weekday"] == target.weekday())
-    ].tail(4)
-    if not recent.empty:
-        return round(float(recent["boardings"].mean()), 1)
-    # 최후 fallback: 전체 해당 stop+hour 평균
-    fallback = df_hist[
-        (df_hist["stop"] == stop) &
-        (df_hist["direction"] == direction) &
-        (df_hist["hour"] == hour)
+    if len(rows) > 0:
+        return float(rows['boardings'].values[0])
+    # 없으면 같은 요일 평균
+    same_wd = history[
+        (history['stop'] == stop) &
+        (history['hour'] == hour) &
+        (history['weekday'] == dt.weekday())
     ]
-    return round(float(fallback["boardings"].mean()), 1) if not fallback.empty else 10.0
+    return float(same_wd['boardings'].mean()) if len(same_wd) > 0 else 0.0
 
-# ── 혼잡도 판정 ──────────────────────────────────────────────────
-def get_congestion(boardings: float) -> str:
-    if boardings >= 36:
-        return "혼잡"
-    if boardings >= 22:
-        return "보통"
-    return "여유"
+# ── GBIS 버스 도착정보 ────────────────────────────────────────────────────
+def fetch_arrival(station_id: str) -> dict | None:
+    try:
+        r = requests.get(GBIS_URL, params={'serviceKey': API_KEY, 'stationId': station_id}, timeout=8)
+        items = r.json()['response']['msgBody']['busArrivalList']
+        if isinstance(items, dict):
+            items = [items]
+        for item in items:
+            if item.get('routeId') == ROUTE_ID and item.get('vehId1'):
+                low  = int(item.get('lowPlate1', 0) or 0)
+                rem  = item.get('remainSeatCnt1', -1)
+                rem  = int(rem) if str(rem).lstrip('-').isdigit() else -1
+                cap  = CAPACITY.get(low, 45)
+                pred = item.get('predictTime1', '')
+                return {
+                    'plateNo':    str(item.get('plateNo1', '')).strip(),
+                    'busType':    low,
+                    'capacity':   cap,
+                    'remainSeat': rem if rem >= 0 else None,
+                    'passengers': cap - rem if rem >= 0 else None,
+                    'predictMin': int(pred) if str(pred).isdigit() else None,
+                }
+    except Exception:
+        pass
+    return None
 
-# ── 예측 실행 ─────────────────────────────────────────────────────
-def run_predict(stop: str, direction: str, hour: int, target: date) -> dict:
-    acad    = get_academic_features(target)
-    weather = get_weather_features(target)
-    lag1    = get_lag1(stop, direction, hour, target)
+# ── 예측 함수 ─────────────────────────────────────────────────────────────
+def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> dict:
+    model = models.get(stop)
+    if model is None:
+        return {'stop': stop, 'error': '모델 없음'}
 
-    features = {
-        "hour":          hour,
-        "weekday":       target.weekday(),
-        "boardings_lag1": lag1,
-        "is_holiday":    int(target in HOLIDAYS_2026),
-        **acad,
+    cal     = get_calendar_features(dt)
+    weather = get_weather(dt)
+    lag1    = get_lag1(stop, hour, dt)
+
+    feats = {
+        'hour':    hour,
+        'weekday': dt.weekday(),
+        **cal,
+        'boardings_lag1': lag1,
         **weather,
     }
+    X    = pd.DataFrame([{k: feats.get(k, 0) for k in FEATURES}])
+    pred = float(model.predict(X)[0])
 
-    FEATURE_ORDER = [
-        "hour", "weekday", "week_num", "sem_num",
-        "is_exam", "is_exam_mid", "is_exam_fin", "is_pre_exam",
-        "is_holiday", "boardings_lag1",
-        "temp_avg", "precip_mm", "is_rainy", "is_cold", "is_hot",
-    ]
-    X = pd.DataFrame([[features[f] for f in FEATURE_ORDER]], columns=FEATURE_ORDER)
+    # 잔여석 상한 적용
+    cap        = arrival['capacity'] if arrival else None
+    remain     = arrival['remainSeat'] if arrival else None
+    capped     = min(pred, remain) if remain is not None else pred
+    capped     = max(0, capped)
 
-    pred = float(models[stop].predict(X)[0])
-    pred = max(0, round(pred, 1))
-
-    overflow = overflow_map.get(stop, 0)
-    if pred >= CAPACITY * 0.9 and overflow > 0:
-        high = round(pred + pred * overflow, 1)
-        status = "혼잡"
+    # 혼잡도
+    threshold  = (cap or 45) * 0.9
+    if capped >= threshold:
+        status = '혼잡'
+    elif capped >= threshold * 0.6:
+        status = '보통'
     else:
-        high = pred
-        status = get_congestion(pred)
+        status = '여유'
 
     return {
-        "stop":       stop,
-        "boardings":  pred,
-        "high":       high,
-        "congestion": status,
-        "lag1_used":  lag1,
+        'stop':       stop,
+        'predicted':  round(capped, 1),
+        'status':     status,
+        'capacity':   cap,
+        'remainSeat': remain,
+        'weather':    weather,
     }
 
-# ── API 엔드포인트 ────────────────────────────────────────────────
-@app.get("/predict")
-def predict(
-    hour: int = Query(..., description="시간대 (7~10: 등교, 13~18: 하교)"),
-    date_str: str = Query(None, alias="date", description="날짜 (YYYY-MM-DD), 생략 시 오늘"),
-):
-    # 날짜 파싱
-    if date_str:
-        try:
-            target = date.fromisoformat(date_str)
-        except ValueError:
-            raise HTTPException(400, "날짜 형식 오류. YYYY-MM-DD로 입력하세요.")
-    else:
-        target = date.today()
-
-    # 방향 결정
-    if 7 <= hour <= 10:
-        direction = "arrive"
-        stops = [ARRIVE_STOP]
-    elif 13 <= hour <= 18:
-        direction = "depart"
-        stops = DEPART_STOPS
-    else:
-        raise HTTPException(400, f"지원하지 않는 시간대입니다. (등교: 7~10시, 하교: 13~18시)")
-
-    results = [run_predict(stop, direction, hour, target) for stop in stops]
-
-    return {
-        "date":      target.isoformat(),
-        "hour":      hour,
-        "direction": direction,
-        "weekday":   ["월","화","수","목","금","토","일"][target.weekday()],
-        "weather":   get_weather_features(target),
-        "stops":     results,
-    }
-
-@app.get("/health")
+# ── 엔드포인트 ────────────────────────────────────────────────────────────
+@app.get('/health')
 def health():
-    return {"status": "ok", "models_loaded": list(models.keys())}
+    return {'status': 'ok', 'models': list(models.keys()), 'time': datetime.now().isoformat()}
 
 
-# ── GBIS 도착정보 프록시 (CORS 우회) ─────────────────────────────
-GBIS_KEY = "J1NNfn5UJ4zegGKBELL2lGTySAkSdNuFdugnZ0Pf5/e2OsLWJOSJOEeSiQObz15Ns1opof3iEqWhwbhTAg5U4A=="
+@app.get('/arrival')
+def arrival():
+    result = {}
+    for stop in ALL_STOPS:
+        sid  = STATION_IDS.get(stop)
+        info = fetch_arrival(sid) if sid else None
+        result[stop] = info
+    return result
 
-@app.get("/arrival")
-async def arrival(stationId: str = Query(...)):
-    url = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2"
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            res = await client.get(url, params={"serviceKey": GBIS_KEY, "stationId": stationId})
-            return res.json()
-        except Exception as e:
-            raise HTTPException(500, str(e))
+
+@app.get('/predict')
+def predict(
+    hour: int  = Query(default=None, description='시간대 (7~18)'),
+    date: str  = Query(default=None, description='날짜 YYYY-MM-DD'),
+):
+    now  = datetime.now()
+    dt   = datetime.strptime(date, '%Y-%m-%d') if date else now
+    hour = hour if hour is not None else now.hour
+
+    # 실시간 도착정보 병렬 조회
+    arrivals = {}
+    for stop in ALL_STOPS:
+        sid = STATION_IDS.get(stop)
+        arrivals[stop] = fetch_arrival(sid) if sid else None
+
+    direction = 'arrive' if hour <= 10 else 'depart'
+    stops     = [ARRIVE_STOP] if direction == 'arrive' else DEPART_STOPS
+
+    results = [predict_stop(s, hour, dt, arrivals.get(s)) for s in stops]
+
+    return {
+        'date':      dt.strftime('%Y-%m-%d'),
+        'hour':      hour,
+        'direction': direction,
+        'stops':     results,
+        'arrivals':  arrivals,
+    }
+
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run('server:app', host='0.0.0.0', port=8000, reload=True)
