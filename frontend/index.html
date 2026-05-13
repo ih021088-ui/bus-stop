@@ -160,7 +160,7 @@
 
 <script>
 // ── API 설정 ──────────────────────────────────────────────────────────
-const GBIS_KEY = 'YOUR_SERVICE_KEY'; // 경기도버스도착정보조회서비스 키
+// GBIS API는 /arrival Cloudflare Function을 통해 호출 (CORS 우회)
 
 // ── 정류장 정보 ───────────────────────────────────────────────────────
 const STOPS = {
@@ -199,10 +199,7 @@ function getColor(congestion) {
 
 // ── GBIS 도착정보 조회 (경기도) ───────────────────────────────────────
 async function fetchGbisArrival(stop) {
-    if (!GBIS_KEY || GBIS_KEY === 'YOUR_SERVICE_KEY') return null;
-
-    const url = `https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2`
-        + `?serviceKey=${GBIS_KEY}&stationId=${stop.stationId}`;
+    const url = `/arrival?stationId=${stop.stationId}`;
 
     try {
         const res = await fetch(url);
@@ -325,19 +322,21 @@ function renderCard(containerId, stop, boardings, arrival) {
     document.getElementById(containerId).appendChild(card);
 }
 
-// ── 혼잡도 데이터 로드 (mock → 추후 /predict API로 교체) ─────────────
-async function fetchData(hour) {
-    // TODO: server.py 완성 후 아래로 교체
-    // const res = await fetch(`/predict?hour=${hour}`);
-    // return await res.json();
+// ── 시간대별 예측 탑승 인원 (과거 데이터 기반 평균) ──────────────────
+const PREDICT_DATA = {
+    '효행초등학교정문': { 13:5.4,  14:7.2,  15:13.4, 16:13.6, 17:11.1, 18:4.1  },
+    '아이파크정문':    { 13:13.7, 14:17.7, 15:34.4, 16:30.3, 17:25.5, 18:12.4 },
+    '신명아파트':      { 13:6.4,  14:6.8,  15:7.3,  16:7.7,  17:7.7,  18:5.7  },
+    '수원대입구':      { 13:21.5, 14:21.6, 15:12.0, 16:11.3, 17:14.0, 18:16.9 },
+    '사당역9번출구앞': { 7:56.8,  8:64.4,  9:54.1,  10:34.7 },
+};
 
-    return {
-        '효행초등학교정문': Math.floor(Math.random() * 28) + 10,
-        '아이파크정문':    Math.floor(Math.random() * 22) + 8,
-        '신명아파트':      Math.floor(Math.random() * 10) + 3,
-        '수원대입구':      Math.floor(Math.random() * 32) + 15,
-        '사당역9번출구앞': Math.floor(Math.random() * 35) + 10,
-    };
+async function fetchData(hour) {
+    const result = {};
+    for (const [stop, hours] of Object.entries(PREDICT_DATA)) {
+        result[stop] = hours[hour] ?? 0;
+    }
+    return result;
 }
 
 async function refreshData() {
