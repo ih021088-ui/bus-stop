@@ -290,28 +290,37 @@ def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> di
     X    = pd.DataFrame([{k: feats.get(k, 0) for k in FEATURES}])
     pred = float(model.predict(X)[0])
 
-    # 잔여석 상한 적용
-    cap        = arrival['capacity'] if arrival else None
-    remain     = arrival['remainSeat'] if arrival else None
-    capped     = min(pred, remain) if remain is not None else pred
-    capped     = max(0, capped)
+    cap    = arrival['capacity'] if arrival else None
+    remain = arrival['remainSeat'] if arrival else None
+    pred   = max(0, pred)
 
-    # 혼잡도
-    threshold  = (cap or 45) * 0.9
-    if capped >= threshold:
+    # 잔여석 실시간 데이터가 있을 때: 탑승 가능 / 다음 버스 인원 계산
+    if remain is not None:
+        can_board = min(round(pred), remain)   # 이번 버스에 탈 수 있는 인원
+        overflow  = max(0, round(pred) - remain)  # 다음 버스로 넘어가는 인원
+    else:
+        can_board = None
+        overflow  = None
+
+    # 혼잡도 (잔여석 기준 우선, 없으면 예측값 기준)
+    threshold = (cap or 45) * 0.9
+    base      = remain if remain is not None else pred
+    if base >= threshold or (overflow or 0) > 0:
         status = '혼잡'
-    elif capped >= threshold * 0.6:
+    elif base >= threshold * 0.6:
         status = '보통'
     else:
         status = '여유'
 
     return {
-        'stop':       stop,
-        'predicted':  round(capped, 1),
-        'status':     status,
-        'capacity':   cap,
+        'stop':      stop,
+        'predicted': round(pred, 1),    # ML 예측 수요 (포화 보정 전)
+        'can_board': can_board,          # 이번 버스 탑승 가능 인원 (실시간)
+        'overflow':  overflow,           # 다음 버스로 넘어가는 인원 (실시간)
+        'status':    status,
+        'capacity':  cap,
         'remainSeat': remain,
-        'weather':    weather,
+        'weather':   weather,
     }
 
 # ── 엔드포인트 ────────────────────────────────────────────────────────────

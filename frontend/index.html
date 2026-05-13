@@ -167,7 +167,7 @@
 <script>
 // ── API 서버 주소 (serveo 터널) ──────────────────────────────────────
 // server.py 재시작하면 URL이 바뀌므로 그때마다 여기 갱신 필요
-const API_BASE = 'https://ec9c5f7d5b01282f-223-195-111-38.serveousercontent.com';
+const API_BASE = 'https://e8184ba1b06c70cb-223-195-111-38.serveousercontent.com';
 
 // ── 정류장 정보 ───────────────────────────────────────────────────────
 const STOPS = {
@@ -289,15 +289,28 @@ function createMarker(stop, boardings, status, arrival) {
 }
 
 // ── 사이드바 카드 렌더링 ──────────────────────────────────────────────
-function renderCard(containerId, stop, boardings, status, arrival) {
-    const congestion = status || getCongestion(boardings);
+function renderCard(containerId, stop, info, status, arrival) {
+    const congestion = status || getCongestion(info.predicted || 0);
     const arrTxt = arrivalText(arrival);
     const card = document.createElement('div');
     card.className = 'stop-card';
+
+    let demandHtml;
+    if (info.can_board !== null && info.can_board !== undefined) {
+        // 실시간 잔여석 있을 때
+        demandHtml = `<span class="boarding">이번 버스 <b>${info.can_board}명</b> 탑승 가능</span>`;
+        if (info.overflow > 0) {
+            demandHtml += `<div style="font-size:12px; color:#c62828; margin-top:3px;">⚠️ 약 <b>${info.overflow}명</b>은 다음 버스</div>`;
+        }
+    } else {
+        // 실시간 없을 때
+        demandHtml = `<span class="boarding">예상 대기 <b>${Math.round(info.predicted || 0)}명</b></span>`;
+    }
+
     card.innerHTML = `
         <div class="stop-name">${stop.name}</div>
         <div class="stop-meta">
-            <span class="boarding">예상 대기 인원 <b>${boardings}명</b></span>
+            ${demandHtml}
             <span class="badge badge-${congestion}">${congestion}</span>
         </div>
         <div class="arrival-info ${arrTxt ? '' : 'none'}">
@@ -355,9 +368,11 @@ async function fetchData(hour) {
         const result = {};
         for (const s of (json.stops || [])) {
             result[s.stop] = {
-                predicted: Math.round(s.predicted ?? 0),
-                status: s.status,
-                capacity: s.capacity,
+                predicted: s.predicted ?? 0,
+                can_board: s.can_board ?? null,
+                overflow:  s.overflow  ?? null,
+                status:    s.status,
+                capacity:  s.capacity,
             };
         }
         return result;
@@ -385,18 +400,18 @@ async function refreshData() {
 
     STOPS.depart.forEach(stop => {
         const info = isArrive ? null : (data[stop.name] ?? null);
-        const boardings = info ? info.predicted : 0;
+        const boardings = info ? Math.round(info.predicted || 0) : 0;
         const status = info ? info.status : null;
         createMarker(stop, boardings, status, arrivals[stop.name]);
-        renderCard('depart-stops', stop, boardings, status, arrivals[stop.name]);
+        renderCard('depart-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name]);
     });
 
     STOPS.arrive.forEach(stop => {
         const info = isArrive ? (data[stop.name] ?? null) : null;
-        const boardings = info ? info.predicted : 0;
+        const boardings = info ? Math.round(info.predicted || 0) : 0;
         const status = info ? info.status : null;
         createMarker(stop, boardings, status, arrivals[stop.name]);
-        renderCard('arrive-stops', stop, boardings, status, arrivals[stop.name]);
+        renderCard('arrive-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name]);
     });
 }
 
