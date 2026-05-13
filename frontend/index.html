@@ -122,6 +122,12 @@
 <header>
     <h1>🚌 7790 버스 혼잡도</h1>
     <div style="display:flex; align-items:center; gap:14px;">
+        <div id="weather-info" style="display:none; align-items:center; gap:8px; background:rgba(255,255,255,0.15); padding:5px 12px; border-radius:20px; font-size:13px;">
+            <span id="weather-icon"></span>
+            <span id="weather-temp"></span>
+            <span id="weather-precip" style="opacity:0.85;"></span>
+            <span id="data-source" style="font-size:11px; font-weight:700; margin-left:4px;"></span>
+        </div>
         <span id="current-time"></span>
         <button class="refresh-btn" onclick="refreshData()">새로고침</button>
     </div>
@@ -159,21 +165,20 @@
 </div>
 
 <script>
-// ── API 설정 ──────────────────────────────────────────────────────────
-// server.py와 같은 origin에서 서빙되면 '' 그대로 사용
-// 로컬에서 파일 직접 열 경우: 'http://localhost:8000'
-const API_BASE = window.location.protocol === 'file:' ? 'http://localhost:8000' : '';
+// ── API 서버 주소 (serveo 터널) ──────────────────────────────────────
+// server.py 재시작하면 URL이 바뀌므로 그때마다 여기 갱신 필요
+const API_BASE = 'https://c93179691ac0bcb6-223-195-111-38.serveousercontent.com';
 
 // ── 정류장 정보 ───────────────────────────────────────────────────────
 const STOPS = {
     depart: [
-        { name: '효행초등학교정문', lat: 37.2160, lng: 126.9691, stationId: '233002245', api: 'gbis' },
-        { name: '아이파크정문',    lat: 37.2138, lng: 126.9707, stationId: '233002371', api: 'gbis' },
-        { name: '신명아파트',      lat: 37.2136, lng: 126.9722, stationId: '233002255', api: 'gbis' },
-        { name: '수원대입구',      lat: 37.2143, lng: 126.9779, stationId: '233003021', api: 'gbis' },
+        { name: '효행초등학교정문', lat: 37.2160, lng: 126.9691, stationId: '233002245' },
+        { name: '아이파크정문',    lat: 37.2138, lng: 126.9707, stationId: '233002371' },
+        { name: '신명아파트',      lat: 37.2136, lng: 126.9722, stationId: '233002255' },
+        { name: '수원대입구',      lat: 37.2143, lng: 126.9779, stationId: '233003021' },
     ],
     arrive: [
-        { name: '사당역9번출구앞', lat: 37.4776, lng: 126.9815, stationId: '119000302', api: 'gbis' },
+        { name: '사당역9번출구앞', lat: 37.4776, lng: 126.9815, stationId: '119000302' },
     ],
 };
 
@@ -187,7 +192,7 @@ const map = new naver.maps.Map('map', {
     zoom: 11,
 });
 
-// ── 혼잡도 판별 ──────────────────────────────────────────────────────
+// ── 혼잡도 판별 (서버가 status 안 줄 때 폴백용) ──────────────────────
 function getCongestion(boardings) {
     const ratio = boardings / CAP_1F;
     if (ratio >= 0.8) return '혼잡';
@@ -199,12 +204,12 @@ function getColor(congestion) {
     return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion];
 }
 
-// ── API 호출 ──────────────────────────────────────────────────────────
+// ── 도착정보 조회 (모든 정류장 한번에) ───────────────────────────────
 async function fetchAllArrivals() {
     try {
         const res = await fetch(`${API_BASE}/arrival`);
         const raw = await res.json();
-        // server.py returns { stopName: {plateNo, busType, capacity, remainSeat, passengers, predictMin} }
+        // server.py 응답: { stopName: {plateNo, busType, capacity, remainSeat, passengers, predictMin} }
         const result = {};
         for (const [name, info] of Object.entries(raw)) {
             if (!info) { result[name] = null; continue; }
@@ -221,9 +226,9 @@ async function fetchAllArrivals() {
 
 // ── 도착정보 텍스트 ───────────────────────────────────────────────────
 function arrivalText(info) {
-    if (!info) return null;
+    if (!info || info.minutes == null) return null;
     const time = info.minutes <= 1 ? '곧 도착' : `${info.minutes}분 후 도착`;
-    const seats = info.seats !== null ? ` · 잔여 ${info.seats}석` : '';
+    const seats = info.seats != null ? ` · 잔여 ${info.seats}석` : '';
     return time + seats;
 }
 
@@ -266,7 +271,7 @@ function createMarker(stop, boardings, status, arrival) {
         content: `
             <div style="padding:14px 16px; min-width:170px; font-family:Arial,sans-serif;">
                 <div style="font-weight:700; font-size:14px; margin-bottom:8px;">${stop.name}</div>
-                <div style="font-size:13px; color:#555;">예상 탑승: <b style="color:#222;">${boardings}명</b></div>
+                <div style="font-size:13px; color:#555;">예상 대기 인원: <b style="color:#222;">${boardings}명</b></div>
                 <div style="font-size:13px; margin-top:4px;">혼잡도: <b style="color:${color};">${congestion}</b></div>
                 ${arrTxt ? `<div style="font-size:12px; margin-top:6px; color:#1565c0;">🕐 ${arrTxt}</div>` : ''}
             </div>`,
@@ -292,7 +297,7 @@ function renderCard(containerId, stop, boardings, status, arrival) {
     card.innerHTML = `
         <div class="stop-name">${stop.name}</div>
         <div class="stop-meta">
-            <span class="boarding">예상 탑승 <b>${boardings}명</b></span>
+            <span class="boarding">예상 대기 인원 <b>${boardings}명</b></span>
             <span class="badge badge-${congestion}">${congestion}</span>
         </div>
         <div class="arrival-info ${arrTxt ? '' : 'none'}">
@@ -309,18 +314,63 @@ function renderCard(containerId, stop, boardings, status, arrival) {
     document.getElementById(containerId).appendChild(card);
 }
 
+// ── 폴백: 과거 데이터 기반 평균 ───────────────────────────────────
+const FALLBACK = {
+    '효행초등학교정문': { 13:5.4,  14:7.2,  15:13.4, 16:13.6, 17:11.1, 18:4.1  },
+    '아이파크정문':    { 13:13.7, 14:17.7, 15:34.4, 16:30.3, 17:25.5, 18:12.4 },
+    '신명아파트':      { 13:6.4,  14:6.8,  15:7.3,  16:7.7,  17:7.7,  18:5.7  },
+    '수원대입구':      { 13:21.5, 14:21.6, 15:12.0, 16:11.3, 17:14.0, 18:16.9 },
+    '사당역9번출구앞': { 7:56.8,  8:64.4,  9:54.1,  10:34.7 },
+};
+
+function updateWeatherUI(weather, isML) {
+    if (!weather) return;
+    const icon = weather.is_rainy ? '🌧️' : weather.is_cold ? '🥶' : weather.is_hot ? '🌡️' : '☀️';
+    const precip = weather.is_rainy ? ` · 강수 ${weather.precip_mm}mm` : '';
+    document.getElementById('weather-icon').textContent = icon;
+    document.getElementById('weather-temp').textContent = `${weather.temp_avg}°C`;
+    document.getElementById('weather-precip').textContent = precip;
+    document.getElementById('weather-info').style.display = 'flex';
+    const src = document.getElementById('data-source');
+    if (src) {
+        src.textContent = isML ? 'AI 예측' : '과거 평균';
+        src.style.color = isML ? '#fff' : 'rgba(255,255,255,0.5)';
+        src.style.fontWeight = isML ? '700' : '400';
+    }
+}
+
 // ── 혼잡도 데이터 로드 (/predict API) ────────────────────────────────
 async function fetchData(hour) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
-        const res = await fetch(`${API_BASE}/predict?hour=${hour}`);
+        const res = await fetch(`${API_BASE}/predict?hour=${hour}`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error('server error');
         const json = await res.json();
+        // server.py 응답: { stops: [{stop, predicted, status, capacity, remainSeat, weather}] }
+        // 날씨는 각 stop에 들어있거나 별도 필드일 수 있음 → 첫 stop의 weather 사용
+        const firstWeather = json.stops?.[0]?.weather || json.weather;
+        updateWeatherUI(firstWeather, true);
         const result = {};
         for (const s of (json.stops || [])) {
-            result[s.stop] = { predicted: s.predicted, status: s.status, capacity: s.capacity };
+            result[s.stop] = {
+                predicted: Math.round(s.predicted ?? 0),
+                status: s.status,
+                capacity: s.capacity,
+            };
         }
         return result;
-    } catch {
-        return {};
+    } catch(e) {
+        clearTimeout(timer);
+        console.warn('[예측 API 실패, 폴백 사용]', e.message);
+        updateWeatherUI({ temp_avg: '-', precip_mm: 0, is_rainy: 0, is_cold: 0, is_hot: 0 }, false);
+        const result = {};
+        for (const [stop, hours] of Object.entries(FALLBACK)) {
+            const boardings = Math.round(hours[hour] ?? 0);
+            result[stop] = { predicted: boardings, status: null, capacity: null };
+        }
+        return result;
     }
 }
 
@@ -336,7 +386,7 @@ async function refreshData() {
     STOPS.depart.forEach(stop => {
         const info = isArrive ? null : (data[stop.name] ?? null);
         const boardings = info ? info.predicted : 0;
-        const status = info ? info.status : '여유';
+        const status = info ? info.status : null;
         createMarker(stop, boardings, status, arrivals[stop.name]);
         renderCard('depart-stops', stop, boardings, status, arrivals[stop.name]);
     });
@@ -344,7 +394,7 @@ async function refreshData() {
     STOPS.arrive.forEach(stop => {
         const info = isArrive ? (data[stop.name] ?? null) : null;
         const boardings = info ? info.predicted : 0;
-        const status = info ? info.status : '여유';
+        const status = info ? info.status : null;
         createMarker(stop, boardings, status, arrivals[stop.name]);
         renderCard('arrive-stops', stop, boardings, status, arrivals[stop.name]);
     });

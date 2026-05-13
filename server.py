@@ -1,3 +1,11 @@
+"""
+7790 버스 혼잡도 예측 API
+GET /predict?hour=15
+GET /predict?hour=15&date=2026-05-13
+GET /arrival          → 모든 정류장의 실시간 도착정보
+GET /health
+"""
+
 import os
 import pickle
 import requests
@@ -73,7 +81,7 @@ def load_resources():
                 models[stop] = pickle.load(f)
     if os.path.exists('./preprocessed.csv'):
         history = pd.read_csv('./preprocessed.csv')
-        history.columns = [c.lstrip('﻿') for c in history.columns]
+        history.columns = [c.lstrip('\ufeff') for c in history.columns]
 
 load_resources()
 
@@ -85,13 +93,6 @@ FINAL_SET:   set = set()
 HOLIDAYS = {'2025_03_01','2025_05_05','2025_05_06','2025_06_06','2026_03_01','2026_05_05'}
 
 def _build_calendar():
-    entries = [
-        ('2025-03-04','2025-06-27','2025_1', list(range(1,18))),
-        ('2025-08-25','2025-08-29','2025_2', [1]),
-        ('2025-09-01','2025-09-05','2025_2', [2]),
-        ('2025-09-08','2025-09-12','2025_2', [3]),
-        ('2026-03-04','2026-04-24','2026_1', list(range(1,9))),
-    ]
     week_entries = [
         ('2025-03-04','2025-03-07','2025_1',1),('2025-03-10','2025-03-14','2025_1',2),
         ('2025-03-17','2025-03-21','2025_1',3),('2025-03-24','2025-03-28','2025_1',4),
