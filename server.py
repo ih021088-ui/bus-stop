@@ -225,3 +225,17 @@ def predict(
 @app.get("/health")
 def health():
     return {"status": "ok", "models_loaded": list(models.keys())}
+
+
+# ── GBIS 도착정보 프록시 (CORS 우회) ─────────────────────────────
+GBIS_KEY = "J1NNfn5UJ4zegGKBELL2lGTySAkSdNuFdugnZ0Pf5/e2OsLWJOSJOEeSiQObz15Ns1opof3iEqWhwbhTAg5U4A=="
+
+@app.get("/arrival")
+async def arrival(stationId: str = Query(...)):
+    url = "https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2"
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            res = await client.get(url, params={"serviceKey": GBIS_KEY, "stationId": stationId})
+            return res.json()
+        except Exception as e:
+            raise HTTPException(500, str(e))
