@@ -122,6 +122,12 @@
 <header>
     <h1>🚌 7790 버스 혼잡도</h1>
     <div style="display:flex; align-items:center; gap:14px;">
+        <div id="weather-info" style="display:none; align-items:center; gap:8px; background:rgba(255,255,255,0.15); padding:5px 12px; border-radius:20px; font-size:13px;">
+            <span id="weather-icon"></span>
+            <span id="weather-temp"></span>
+            <span id="weather-precip" style="opacity:0.85;"></span>
+            <span id="data-source" style="font-size:11px; font-weight:700; margin-left:4px;"></span>
+        </div>
         <span id="current-time"></span>
         <button class="refresh-btn" onclick="refreshData()">새로고침</button>
     </div>
@@ -199,7 +205,7 @@ function getColor(congestion) {
 
 // ── GBIS 도착정보 조회 (경기도) ───────────────────────────────────────
 async function fetchGbisArrival(stop) {
-    const url = `/arrival?stationId=${stop.stationId}`;
+    const url = `${API_BASE}/arrival?stationId=${stop.stationId}`;
 
     try {
         const res = await fetch(url);
@@ -279,7 +285,7 @@ function createMarker(stop, boardings, arrival) {
         content: `
             <div style="padding:14px 16px; min-width:170px; font-family:Arial,sans-serif;">
                 <div style="font-weight:700; font-size:14px; margin-bottom:8px;">${stop.name}</div>
-                <div style="font-size:13px; color:#555;">예상 탑승: <b style="color:#222;">${boardings}명</b></div>
+                <div style="font-size:13px; color:#555;">예상 대기 인원: <b style="color:#222;">${boardings}명</b></div>
                 <div style="font-size:13px; margin-top:4px;">혼잡도: <b style="color:${color};">${congestion}</b></div>
                 ${arrTxt ? `<div style="font-size:12px; margin-top:6px; color:#1565c0;">🕐 ${arrTxt}</div>` : ''}
             </div>`,
@@ -305,7 +311,7 @@ function renderCard(containerId, stop, boardings, arrival) {
     card.innerHTML = `
         <div class="stop-name">${stop.name}</div>
         <div class="stop-meta">
-            <span class="boarding">예상 탑승 <b>${boardings}명</b></span>
+            <span class="boarding">예상 대기 인원 <b>${boardings}명</b></span>
             <span class="badge badge-${congestion}">${congestion}</span>
         </div>
         <div class="arrival-info ${arrTxt ? '' : 'none'}">
@@ -322,8 +328,11 @@ function renderCard(containerId, stop, boardings, arrival) {
     document.getElementById(containerId).appendChild(card);
 }
 
-// ── 시간대별 예측 탑승 인원 (과거 데이터 기반 평균) ──────────────────
-const PREDICT_DATA = {
+// ── API 서버 주소 ─────────────────────────────────────────────────
+const API_BASE = 'https://c93179691ac0bcb6-223-195-111-38.serveousercontent.com';
+
+// ── 폴백: 과거 데이터 기반 평균 ───────────────────────────────────
+const FALLBACK = {
     '효행초등학교정문': { 13:5.4,  14:7.2,  15:13.4, 16:13.6, 17:11.1, 18:4.1  },
     '아이파크정문':    { 13:13.7, 14:17.7, 15:34.4, 16:30.3, 17:25.5, 18:12.4 },
     '신명아파트':      { 13:6.4,  14:6.8,  15:7.3,  16:7.7,  17:7.7,  18:5.7  },
@@ -331,12 +340,40 @@ const PREDICT_DATA = {
     '사당역9번출구앞': { 7:56.8,  8:64.4,  9:54.1,  10:34.7 },
 };
 
+function updateWeatherUI(weather, isML) {
+    if (!weather) return;
+    const icon = weather.is_rainy ? '🌧️' : weather.is_cold ? '🥶' : weather.is_hot ? '🌡️' : '☀️';
+    const precip = weather.is_rainy ? ` · 강수 ${weather.precip_mm}mm` : '';
+    document.getElementById('weather-icon').textContent = icon;
+    document.getElementById('weather-temp').textContent = `${weather.temp_avg}°C`;
+    document.getElementById('weather-precip').textContent = precip;
+    document.getElementById('weather-info').style.display = 'flex';
+    const src = document.getElementById('data-source');
+    if (src) { src.textContent = isML ? 'AI 예측' : '과거 평균'; src.style.color = isML ? '#fff' : 'rgba(255,255,255,0.5)'; src.style.fontWeight = isML ? '700' : '400'; }
+}
+
 async function fetchData(hour) {
-    const result = {};
-    for (const [stop, hours] of Object.entries(PREDICT_DATA)) {
-        result[stop] = hours[hour] ?? 0;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+        const res = await fetch(`${API_BASE}/predict?hour=${hour}`, { signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) throw new Error('server error');
+        const json = await res.json();
+        updateWeatherUI(json.weather, true);
+        const result = {};
+        json.stops.forEach(s => { result[s.stop] = Math.round(s.boardings); });
+        return result;
+    } catch(e) {
+        clearTimeout(timer);
+        console.warn('[예측 API 실패, 폴백 사용]', e.message);
+        updateWeatherUI({ temp_avg: '-', precip_mm: 0, is_rainy: 0, is_cold: 0, is_hot: 0 }, false);
+        const result = {};
+        for (const [stop, hours] of Object.entries(FALLBACK)) {
+            result[stop] = hours[hour] ?? 0;
+        }
+        return result;
     }
-    return result;
 }
 
 async function refreshData() {
