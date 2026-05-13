@@ -153,21 +153,49 @@ def get_calendar_features(dt: datetime) -> dict:
         'is_holiday':  int(key in HOLIDAYS),
     }
 
-# ── 날씨 조회 (Open-Meteo forecast) ──────────────────────────────────────
+# ── 날씨 조회 (기상청 단기예보 → Open-Meteo fallback) ────────────────────
+KMA_URL = 'https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst'
+KMA_NX, KMA_NY = 57, 119  # 화성시 봉담읍 (수원대 근처)
+
+def _kma_base_time(dt: datetime) -> tuple[str, str]:
+    base_hours = [2, 5, 8, 11, 14, 17, 20, 23]
+    valid = [t for t in base_hours if t <= dt.hour]
+    if not valid:
+        prev = dt - timedelta(days=1)
+        return prev.strftime('%Y%m%d'), '2300'
+    return dt.strftime('%Y%m%d'), f'{max(valid):02d}00'
+
 def get_weather(dt: datetime) -> dict:
-    date_str = dt.strftime('%Y-%m-%d')
+    fallback = {'temp_avg': 15.0, 'precip_mm': 0.0, 'is_rainy': 0, 'is_cold': 0, 'is_hot': 0}
+    date_str = dt.strftime('%Y%m%d')
     try:
-        r = requests.get('https://api.open-meteo.com/v1/forecast', params={
-            'latitude': 37.27, 'longitude': 126.99,
-            'daily': 'temperature_2m_max,temperature_2m_min,precipitation_sum',
-            'timezone': 'Asia/Seoul',
-            'start_date': date_str, 'end_date': date_str,
+        base_date, base_time = _kma_base_time(dt)
+        r = requests.get(KMA_URL, params={
+            'serviceKey': API_KEY,
+            'pageNo': 1, 'numOfRows': 1000,
+            'dataType': 'JSON',
+            'base_date': base_date, 'base_time': base_time,
+            'nx': KMA_NX, 'ny': KMA_NY,
         }, timeout=8)
-        d = r.json()['daily']
-        t_max = d['temperature_2m_max'][0] or 15
-        t_min = d['temperature_2m_min'][0] or 10
-        precip = d['precipitation_sum'][0] or 0
-        t_avg = (t_max + t_min) / 2
+        items = r.json()['response']['body']['items']['item']
+        tmps, pcps = [], []
+        for item in items:
+            if item['fcstDate'] != date_str:
+                continue
+            cat, val = item['category'], item['fcstValue']
+            if cat == 'TMP':
+                try: tmps.append(float(val))
+                except: pass
+            elif cat == 'PCP':
+                if val == '강수없음':
+                    pcps.append(0.0)
+                else:
+                    try: pcps.append(float(str(val).replace('mm', '').strip()))
+                    except: pass
+        if not tmps:
+            raise ValueError('no TMP data')
+        t_avg = sum(tmps) / len(tmps)
+        precip = sum(pcps)
         return {
             'temp_avg':  round(t_avg, 1),
             'precip_mm': round(precip, 1),
@@ -176,7 +204,25 @@ def get_weather(dt: datetime) -> dict:
             'is_hot':    int(t_avg > 28),
         }
     except Exception:
-        return {'temp_avg': 15.0, 'precip_mm': 0.0, 'is_rainy': 0, 'is_cold': 0, 'is_hot': 0}
+        try:
+            r2 = requests.get('https://api.open-meteo.com/v1/forecast', params={
+                'latitude': 37.27, 'longitude': 126.99,
+                'daily': 'temperature_2m_max,temperature_2m_min,precipitation_sum',
+                'timezone': 'Asia/Seoul',
+                'start_date': dt.strftime('%Y-%m-%d'), 'end_date': dt.strftime('%Y-%m-%d'),
+            }, timeout=8)
+            d = r2.json()['daily']
+            t_avg = ((d['temperature_2m_max'][0] or 15) + (d['temperature_2m_min'][0] or 10)) / 2
+            precip = d['precipitation_sum'][0] or 0
+            return {
+                'temp_avg':  round(t_avg, 1),
+                'precip_mm': round(precip, 1),
+                'is_rainy':  int(precip > 0.5),
+                'is_cold':   int(t_avg < 5),
+                'is_hot':    int(t_avg > 28),
+            }
+        except Exception:
+            return fallback
 
 # ── 전날 탑승 인원 (lag1) ────────────────────────────────────────────────
 def get_lag1(stop: str, hour: int, dt: datetime) -> float:
