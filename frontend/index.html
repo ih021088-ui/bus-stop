@@ -159,21 +159,19 @@
 </div>
 
 <script>
-// ── TAGO API 설정 ─────────────────────────────────────────────────────
-const TAGO_KEY = 'YOUR_SERVICE_KEY'; // data.go.kr에서 발급받은 키로 교체
+// ── API 설정 ──────────────────────────────────────────────────────────
+const GBIS_KEY = 'YOUR_SERVICE_KEY'; // 경기도버스도착정보조회서비스 키
 
 // ── 정류장 정보 ───────────────────────────────────────────────────────
-// nodeId: TAGO API 정류소 ID (아래 '정류소 ID 찾는 법' 참고)
-// cityCode: TAGO 도시 코드 (서울 11, 경기 각 시별 상이)
 const STOPS = {
     depart: [
-        { name: '효행초등학교정문', lat: 37.2160, lng: 126.9691, cityCode: '', nodeId: '' },
-        { name: '아이파크정문',    lat: 37.2138, lng: 126.9707, cityCode: '', nodeId: '' },
-        { name: '신명아파트',      lat: 37.2136, lng: 126.9722, cityCode: '', nodeId: '' },
-        { name: '수원대입구',      lat: 37.2143, lng: 126.9779, cityCode: '', nodeId: '' },
+        { name: '효행초등학교정문', lat: 37.2160, lng: 126.9691, stationId: '233002245', api: 'gbis' },
+        { name: '아이파크정문',    lat: 37.2138, lng: 126.9707, stationId: '233002371', api: 'gbis' },
+        { name: '신명아파트',      lat: 37.2136, lng: 126.9722, stationId: '233002255', api: 'gbis' },
+        { name: '수원대입구',      lat: 37.2143, lng: 126.9779, stationId: '233003021', api: 'gbis' },
     ],
     arrive: [
-        { name: '사당역9번출구앞', lat: 37.4776, lng: 126.9815, cityCode: '11', nodeId: '' },
+        { name: '사당역9번출구앞', lat: 37.4776, lng: 126.9815, stationId: '119000302', api: 'gbis' },
     ],
 };
 
@@ -199,32 +197,34 @@ function getColor(congestion) {
     return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion];
 }
 
-// ── TAGO 도착정보 조회 ────────────────────────────────────────────────
-async function fetchArrivalForStop(stop) {
-    if (!stop.nodeId || !stop.cityCode || TAGO_KEY === 'YOUR_SERVICE_KEY') return null;
+// ── GBIS 도착정보 조회 (경기도) ───────────────────────────────────────
+async function fetchGbisArrival(stop) {
+    if (!GBIS_KEY || GBIS_KEY === 'YOUR_SERVICE_KEY') return null;
 
-    const url = `http://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList`
-        + `?serviceKey=${TAGO_KEY}&cityCode=${stop.cityCode}&nodeId=${stop.nodeId}&_type=json`;
+    const url = `https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2`
+        + `?serviceKey=${GBIS_KEY}&stationId=${stop.stationId}`;
 
     try {
         const res = await fetch(url);
         const json = await res.json();
-        const raw = json?.response?.body?.items?.item;
-        if (!raw) return null;
+        const list = json?.response?.msgBody?.busArrivalList;
+        if (!list) return null;
 
-        const list = Array.isArray(raw) ? raw : [raw];
-        const buses = list
-            .filter(item => String(item.routeno).replace(/\s/g, '') === '7790')
-            .sort((a, b) => a.arrtime - b.arrtime);
-
-        if (buses.length === 0) return null;
+        const bus = list.find(item => String(item.routeName) === '7790');
+        if (!bus || !bus.predictTime1) return null;
+        const seats = parseInt(bus.remainSeatCnt1);
         return {
-            minutes: Math.ceil(buses[0].arrtime / 60),
-            prevStops: buses[0].arrprevstationcnt,
+            minutes: parseInt(bus.predictTime1),
+            seats: seats > 0 ? seats : null,
         };
     } catch {
         return null;
     }
+}
+
+// ── API 호출 ──────────────────────────────────────────────────────────
+async function fetchArrivalForStop(stop) {
+    return fetchGbisArrival(stop);
 }
 
 async function fetchAllArrivals() {
@@ -238,8 +238,9 @@ async function fetchAllArrivals() {
 // ── 도착정보 텍스트 ───────────────────────────────────────────────────
 function arrivalText(info) {
     if (!info) return null;
-    if (info.minutes <= 1) return '곧 도착';
-    return `${info.minutes}분 후 도착 (${info.prevStops}정류장 전)`;
+    const time = info.minutes <= 1 ? '곧 도착' : `${info.minutes}분 후 도착`;
+    const seats = info.seats !== null ? ` · 잔여 ${info.seats}석` : '';
+    return time + seats;
 }
 
 // ── 마커 생성 ────────────────────────────────────────────────────────
