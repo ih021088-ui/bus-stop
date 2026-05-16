@@ -4,7 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>7790 버스 혼잡도</title>
-    <script src="https://oapi.map.naver.com/openapi/v3/maps.js?ncpKeyId=0puucmux88"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Noto Sans KR', Arial, sans-serif; height: 100vh; display: flex; flex-direction: column; }
@@ -115,6 +116,10 @@
             color: #999;
             font-size: 13px;
         }
+
+        /* Leaflet 마커 컨테이너가 내용을 clip하지 않도록 */
+        .leaflet-marker-icon { overflow: visible; }
+        .leaflet-div-icon { background: none; border: none; }
     </style>
 </head>
 <body>
@@ -156,18 +161,20 @@
             </select>
         </div>
 
-        <div class="section-label">하교 방향 (수원대 → 사당)</div>
-        <div id="depart-stops"><div class="loading">로딩 중...</div></div>
+        <div id="depart-section">
+            <div class="section-label">하교 방향 (수원대 → 사당)</div>
+            <div id="depart-stops"><div class="loading">로딩 중...</div></div>
+        </div>
 
-        <div class="section-label">등교 방향 (사당 → 수원대)</div>
-        <div id="arrive-stops"><div class="loading">로딩 중...</div></div>
+        <div id="arrive-section">
+            <div class="section-label">등교 방향 (사당 → 수원대)</div>
+            <div id="arrive-stops"><div class="loading">로딩 중...</div></div>
+        </div>
     </div>
 </div>
 
 <script>
-// ── API 서버 주소 (serveo 터널) ──────────────────────────────────────
-// server.py 재시작하면 URL이 바뀌므로 그때마다 여기 갱신 필요
-const API_BASE = 'https://e8184ba1b06c70cb-223-195-111-38.serveousercontent.com';
+const API_BASE = '';
 
 // ── 정류장 정보 ───────────────────────────────────────────────────────
 const STOPS = {
@@ -184,13 +191,13 @@ const STOPS = {
 
 const CAP_1F = 45;
 const markers = {};
-const infoWindows = {};
 
-// ── 지도 초기화 ──────────────────────────────────────────────────────
-const map = new naver.maps.Map('map', {
-    center: new naver.maps.LatLng(37.37, 126.98),
-    zoom: 11,
-});
+// ── 지도 초기화 (Leaflet + OpenStreetMap) ────────────────────────────
+const map = L.map('map').setView([37.37, 126.98], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    maxZoom: 19,
+}).addTo(map);
 
 // ── 혼잡도 판별 (서버가 status 안 줄 때 폴백용) ──────────────────────
 function getCongestion(boardings) {
@@ -204,24 +211,14 @@ function getColor(congestion) {
     return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion];
 }
 
-// ── 도착정보 조회 (모든 정류장 한번에) ───────────────────────────────
-async function fetchAllArrivals() {
-    try {
-        const res = await fetch(`${API_BASE}/arrival`);
-        const raw = await res.json();
-        // server.py 응답: { stopName: {plateNo, busType, capacity, remainSeat, passengers, predictMin} }
-        const result = {};
-        for (const [name, info] of Object.entries(raw)) {
-            if (!info) { result[name] = null; continue; }
-            result[name] = {
-                minutes: info.predictMin,
-                seats: info.remainSeat,
-            };
-        }
-        return result;
-    } catch {
-        return {};
+// ── 도착정보 변환 (서버 arrivals → {minutes, seats}) ─────────────────
+function parseArrivals(raw) {
+    const result = {};
+    for (const [name, info] of Object.entries(raw || {})) {
+        if (!info) { result[name] = null; continue; }
+        result[name] = { minutes: info.predictMin, seats: info.remainSeat };
     }
+    return result;
 }
 
 // ── 도착정보 텍스트 ───────────────────────────────────────────────────
@@ -232,60 +229,63 @@ function arrivalText(info) {
     return time + seats;
 }
 
-// ── 마커 생성 ────────────────────────────────────────────────────────
-function createMarker(stop, boardings, status, arrival) {
+// ── 마커 생성 (Leaflet divIcon) ──────────────────────────────────────
+function createMarker(stop, boardings, status, arrival, can_board, overflow) {
     const congestion = status || getCongestion(boardings);
     const color = getColor(congestion);
     const arrTxt = arrivalText(arrival);
 
-    if (markers[stop.name]) markers[stop.name].setMap(null);
-    if (infoWindows[stop.name]) infoWindows[stop.name].close();
+    if (markers[stop.name]) markers[stop.name].remove();
 
-    const marker = new naver.maps.Marker({
-        position: new naver.maps.LatLng(stop.lat, stop.lng),
-        map,
-        icon: {
-            content: `
-                <div style="
-                    background:${color};
-                    color:#fff;
-                    padding:6px 12px;
-                    border-radius:20px;
-                    font-size:12px;
-                    font-weight:700;
-                    white-space:nowrap;
-                    box-shadow:0 2px 8px rgba(0,0,0,0.25);
-                    cursor:pointer;
-                    line-height:1.6;
-                    text-align:center;
-                ">
-                    ${stop.name}<br>
-                    <span style="font-size:11px;font-weight:400;">${boardings}명 · ${congestion}</span>
-                    ${arrTxt ? `<br><span style="font-size:10px;font-weight:400;opacity:0.9;">🕐 ${arrTxt}</span>` : ''}
-                </div>`,
-            anchor: new naver.maps.Point(60, 20),
-        },
-    });
-
-    const infoWindow = new naver.maps.InfoWindow({
-        content: `
-            <div style="padding:14px 16px; min-width:170px; font-family:Arial,sans-serif;">
-                <div style="font-weight:700; font-size:14px; margin-bottom:8px;">${stop.name}</div>
-                <div style="font-size:13px; color:#555;">예상 대기 인원: <b style="color:#222;">${boardings}명</b></div>
-                <div style="font-size:13px; margin-top:4px;">혼잡도: <b style="color:${color};">${congestion}</b></div>
-                ${arrTxt ? `<div style="font-size:12px; margin-top:6px; color:#1565c0;">🕐 ${arrTxt}</div>` : ''}
+    const icon = L.divIcon({
+        html: `
+            <div style="
+                display:inline-block;
+                transform:translateX(-50%);
+                background:${color};
+                color:#fff;
+                padding:6px 12px;
+                border-radius:20px;
+                font-size:12px;
+                font-weight:700;
+                white-space:nowrap;
+                box-shadow:0 2px 8px rgba(0,0,0,0.25);
+                cursor:pointer;
+                line-height:1.6;
+                text-align:center;
+            ">
+                ${stop.name}<br>
+                <span style="font-size:11px;font-weight:400;">${boardings}명 · ${congestion}</span>
+                ${arrTxt ? `<br><span style="font-size:10px;font-weight:400;opacity:0.9;">🕐 ${arrTxt}</span>` : ''}
             </div>`,
-        borderWidth: 1,
-        borderColor: '#ddd',
+        className: '',
+        iconSize: [0, 0],
+        iconAnchor: [0, 20],
     });
 
-    naver.maps.Event.addListener(marker, 'click', () => {
-        Object.values(infoWindows).forEach(iw => iw.close());
-        infoWindow.open(map, marker);
-    });
+    let demandLine;
+    if (can_board !== null && can_board !== undefined) {
+        demandLine = `<div style="font-size:13px; color:#555;">이번 버스 <b style="color:#222;">${can_board}명</b> 탑승 가능</div>`;
+        if (overflow > 0) {
+            demandLine += `<div style="font-size:12px; color:#c62828; margin-top:2px;">⚠️ 약 <b>${overflow}명</b>은 다음 버스</div>`;
+        }
+    } else {
+        demandLine = `<div style="font-size:13px; color:#555;">예상 대기 인원: <b style="color:#222;">${boardings}명</b></div>`;
+    }
+
+    const popupContent = `
+        <div style="padding:10px 12px; min-width:160px; font-family:Arial,sans-serif;">
+            <div style="font-weight:700; font-size:14px; margin-bottom:6px;">${stop.name}</div>
+            ${demandLine}
+            <div style="font-size:13px; margin-top:4px;">혼잡도: <b style="color:${color};">${congestion}</b></div>
+            ${arrTxt ? `<div style="font-size:12px; margin-top:6px; color:#1565c0;">🕐 ${arrTxt}</div>` : ''}
+        </div>`;
+
+    const marker = L.marker([stop.lat, stop.lng], { icon })
+        .addTo(map)
+        .bindPopup(popupContent);
 
     markers[stop.name] = marker;
-    infoWindows[stop.name] = infoWindow;
 }
 
 // ── 사이드바 카드 렌더링 ──────────────────────────────────────────────
@@ -297,13 +297,11 @@ function renderCard(containerId, stop, info, status, arrival) {
 
     let demandHtml;
     if (info.can_board !== null && info.can_board !== undefined) {
-        // 실시간 잔여석 있을 때
         demandHtml = `<span class="boarding">이번 버스 <b>${info.can_board}명</b> 탑승 가능</span>`;
         if (info.overflow > 0) {
             demandHtml += `<div style="font-size:12px; color:#c62828; margin-top:3px;">⚠️ 약 <b>${info.overflow}명</b>은 다음 버스</div>`;
         }
     } else {
-        // 실시간 없을 때
         demandHtml = `<span class="boarding">예상 대기 <b>${Math.round(info.predicted || 0)}명</b></span>`;
     }
 
@@ -318,10 +316,9 @@ function renderCard(containerId, stop, info, status, arrival) {
         </div>`;
 
     card.onclick = () => {
-        map.panTo(new naver.maps.LatLng(stop.lat, stop.lng));
-        map.setZoom(15, true);
-        Object.values(infoWindows).forEach(iw => iw.close());
-        infoWindows[stop.name]?.open(map, markers[stop.name]);
+        map.setView([stop.lat, stop.lng], 15);
+        Object.values(markers).forEach(m => m.closePopup());
+        markers[stop.name]?.openPopup();
     };
 
     document.getElementById(containerId).appendChild(card);
@@ -353,21 +350,27 @@ function updateWeatherUI(weather, isML) {
 }
 
 // ── 혼잡도 데이터 로드 (/predict API) ────────────────────────────────
+// 반환값: { isServiceDay, direction, reason, stops, arrivals }
 async function fetchData(hour) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
+    const timer = setTimeout(() => controller.abort(), 15000);
     try {
         const res = await fetch(`${API_BASE}/predict?hour=${hour}`, { signal: controller.signal });
         clearTimeout(timer);
         if (!res.ok) throw new Error('server error');
         const json = await res.json();
-        // server.py 응답: { stops: [{stop, predicted, status, capacity, remainSeat, weather}] }
-        // 날씨는 각 stop에 들어있거나 별도 필드일 수 있음 → 첫 stop의 weather 사용
-        const firstWeather = json.stops?.[0]?.weather || json.weather;
+
+        // 주말·공휴일
+        if (!json.is_service_day) {
+            return { isServiceDay: false, direction: json.direction, reason: json.reason, stops: {}, arrivals: {} };
+        }
+
+        const firstWeather = json.stops?.[0]?.weather;
         updateWeatherUI(firstWeather, true);
-        const result = {};
+
+        const stops = {};
         for (const s of (json.stops || [])) {
-            result[s.stop] = {
+            stops[s.stop] = {
                 predicted: s.predicted ?? 0,
                 can_board: s.can_board ?? null,
                 overflow:  s.overflow  ?? null,
@@ -375,43 +378,90 @@ async function fetchData(hour) {
                 capacity:  s.capacity,
             };
         }
-        return result;
+        return {
+            isServiceDay: true,
+            direction: json.direction,
+            stops,
+            arrivals: parseArrivals(json.arrivals),
+        };
     } catch(e) {
         clearTimeout(timer);
         console.warn('[예측 API 실패, 폴백 사용]', e.message);
         updateWeatherUI({ temp_avg: '-', precip_mm: 0, is_rainy: 0, is_cold: 0, is_hot: 0 }, false);
-        const result = {};
-        for (const [stop, hours] of Object.entries(FALLBACK)) {
-            const boardings = Math.round(hours[hour] ?? 0);
-            result[stop] = { predicted: boardings, status: null, capacity: null };
+        const stops = {};
+        for (const [name, hours] of Object.entries(FALLBACK)) {
+            stops[name] = { predicted: Math.round(hours[hour] ?? 0), status: null, capacity: null };
         }
-        return result;
+        return {
+            isServiceDay: true,
+            direction: hour <= 10 ? 'arrive' : 'depart',
+            stops,
+            arrivals: {},
+        };
     }
+}
+
+function showNotServiceDay(reason) {
+    const msg = `
+        <div style="padding:30px 20px; text-align:center; color:#888;">
+            <div style="font-size:32px; margin-bottom:12px;">${reason === '공휴일' ? '🏖️' : '🛌'}</div>
+            <div style="font-size:15px; font-weight:700; color:#555; margin-bottom:6px;">${reason}입니다</div>
+            <div style="font-size:13px; line-height:1.6;">
+                7790 버스 예측은 평일(월~금)에만<br>제공됩니다.
+            </div>
+        </div>`;
+    document.getElementById('depart-section').innerHTML = msg;
+    document.getElementById('arrive-section').innerHTML = '';
+
+    // 마커는 정류장 위치만 표시 (예측값 없이)
+    [...STOPS.depart, ...STOPS.arrive].forEach(stop => {
+        if (markers[stop.name]) markers[stop.name].remove();
+        const icon = L.divIcon({
+            html: `<div style="display:inline-block;transform:translateX(-50%);background:#9e9e9e;color:#fff;padding:5px 10px;border-radius:20px;font-size:11px;font-weight:700;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,0.2);">${stop.name}</div>`,
+            className: '',
+            iconSize: [0, 0],
+            iconAnchor: [0, 18],
+        });
+        markers[stop.name] = L.marker([stop.lat, stop.lng], { icon }).addTo(map);
+    });
 }
 
 async function refreshData() {
     const hour = parseInt(document.getElementById('hour-select').value);
-    const [data, arrivals] = await Promise.all([fetchData(hour), fetchAllArrivals()]);
+    const { isServiceDay, direction, reason, stops, arrivals } = await fetchData(hour);
+
+    if (!isServiceDay) {
+        showNotServiceDay(reason);
+        return;
+    }
+
+    // 주말 메시지가 section을 덮어쓴 경우 원래 구조 복원
+    if (!document.getElementById('depart-stops')) {
+        document.getElementById('depart-section').innerHTML =
+            '<div class="section-label">하교 방향 (수원대 → 사당)</div><div id="depart-stops"></div>';
+        document.getElementById('arrive-section').innerHTML =
+            '<div class="section-label">등교 방향 (사당 → 수원대)</div><div id="arrive-stops"></div>';
+    }
 
     document.getElementById('depart-stops').innerHTML = '';
     document.getElementById('arrive-stops').innerHTML = '';
 
-    const isArrive = hour <= 10;
+    const isArrive = direction === 'arrive';
 
     STOPS.depart.forEach(stop => {
-        const info = isArrive ? null : (data[stop.name] ?? null);
+        const info = isArrive ? null : (stops[stop.name] ?? null);
         const boardings = info ? Math.round(info.predicted || 0) : 0;
         const status = info ? info.status : null;
-        createMarker(stop, boardings, status, arrivals[stop.name]);
-        renderCard('depart-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name]);
+        createMarker(stop, boardings, status, arrivals[stop.name] ?? null, info?.can_board, info?.overflow);
+        renderCard('depart-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name] ?? null);
     });
 
     STOPS.arrive.forEach(stop => {
-        const info = isArrive ? (data[stop.name] ?? null) : null;
+        const info = isArrive ? (stops[stop.name] ?? null) : null;
         const boardings = info ? Math.round(info.predicted || 0) : 0;
         const status = info ? info.status : null;
-        createMarker(stop, boardings, status, arrivals[stop.name]);
-        renderCard('arrive-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name]);
+        createMarker(stop, boardings, status, arrivals[stop.name] ?? null, info?.can_board, info?.overflow);
+        renderCard('arrive-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name] ?? null);
     });
 }
 

@@ -51,6 +51,14 @@ def build_week_map():
         ('2026-04-06', '2026-04-10',  '2026_1', 6),
         ('2026-04-13', '2026-04-17',  '2026_1', 7),
         ('2026-04-20', '2026-04-24',  '2026_1', 8),
+        ('2026-04-27', '2026-05-01',  '2026_1', 9),
+        ('2026-05-04', '2026-05-08',  '2026_1', 10),
+        ('2026-05-11', '2026-05-15',  '2026_1', 11),
+        ('2026-05-18', '2026-05-22',  '2026_1', 12),
+        ('2026-05-25', '2026-05-29',  '2026_1', 13),
+        ('2026-06-01', '2026-06-05',  '2026_1', 14),
+        ('2026-06-08', '2026-06-12',  '2026_1', 15),
+        ('2026-06-15', '2026-06-19',  '2026_1', 16),
     ]
 
     date_to_week = {}
@@ -77,7 +85,7 @@ def build_exam_sets():
         return dates
 
     midterm = date_range('2025-04-16', '2025-04-30') | date_range('2026-04-16', '2026-04-30')
-    final   = date_range('2025-06-04', '2025-06-17')
+    final   = date_range('2025-06-04', '2025-06-17') | date_range('2026-06-08', '2026-06-19')
     return midterm, final
 
 # ── 공휴일 (수동 입력) ────────────────────────────────────────────
@@ -115,7 +123,7 @@ def parse_file(filepath, week_map, semester_map, midterm_set, final_set):
     is_holiday   = int(date_str in HOLIDAYS)
 
     # 시험 직전 주 (중간고사 기준: 2025 7주차, 2026 7주차 / 기말: 2025 13주차)
-    pre_exam_weeks = {('2025_1', 6), ('2026_1', 6), ('2025_1', 13)}
+    pre_exam_weeks = {('2025_1', 6), ('2026_1', 6), ('2025_1', 13), ('2026_1', 13)}
     is_pre_exam = int((semester, week_num) in pre_exam_weeks)
 
     # 학기 구분 (1학기=1, 2학기=2)
@@ -212,9 +220,15 @@ def build_dataset(data_dir='./해커톤데이터2'):
 
     df = pd.DataFrame(all_rows)
 
-    # lag feature: 같은 정류장, 같은 방향, 같은 시간대 전날 탑승 수
     df = df.sort_values(['stop', 'direction', 'hour', 'date']).reset_index(drop=True)
-    df['boardings_lag1'] = df.groupby(['stop', 'direction', 'hour'])['boardings'].shift(1)
+
+    grp = df.groupby(['stop', 'direction', 'hour'])['boardings']
+    # lag1: 직전 평일 (shift(1))
+    df['boardings_lag1']  = grp.shift(1)
+    # lag7: 약 1주 전 같은 요일 (평일 기준 shift(5))
+    df['boardings_lag7']  = grp.shift(5)
+    # roll3: 직전 3 평일 탑승 수 평균
+    df['boardings_roll3'] = grp.transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
 
     return df
 

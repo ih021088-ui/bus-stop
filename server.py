@@ -14,7 +14,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from urllib.parse import unquote
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -25,7 +25,7 @@ API_KEY   = unquote(os.environ.get(
     'J1NNfn5UJ4zegGKBELL2lGTySAkSdNuFdugnZ0Pf5/e2OsLWJOSJOEeSiQObz15Ns1opof3iEqWhwbhTAg5U4A=='
 ))
 GBIS_URL  = 'https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2'
-ROUTE_ID  = 200000149   # 7790 경기버스
+ROUTE_ID  = '200000149'   # 7790 경기버스
 
 DEPART_STOPS = ['효행초등학교정문', '아이파크정문', '신명아파트', '수원대입구']
 ARRIVE_STOP  = '사당역9번출구앞'
@@ -43,7 +43,7 @@ CAPACITY = {0: 45, 1: 45, 2: 70}   # lowPlate → 정원
 FEATURES = [
     'hour', 'weekday', 'week_num', 'sem_num',
     'is_exam', 'is_exam_mid', 'is_exam_fin', 'is_pre_exam', 'is_holiday',
-    'boardings_lag1',
+    'boardings_lag1', 'boardings_lag7', 'boardings_roll3',
     'temp_avg', 'precip_mm', 'is_rainy', 'is_cold', 'is_hot',
 ]
 
@@ -71,9 +71,10 @@ def root():
 MODEL_DIR = './models'
 models: dict = {}
 history: pd.DataFrame | None = None
+overflow_map: dict = {}
 
 def load_resources():
-    global models, history
+    global models, history, overflow_map
     for stop in ALL_STOPS:
         path = os.path.join(MODEL_DIR, f'model_{stop}.pkl')
         if os.path.exists(path):
@@ -82,6 +83,10 @@ def load_resources():
     if os.path.exists('./preprocessed.csv'):
         history = pd.read_csv('./preprocessed.csv')
         history.columns = [c.lstrip('\ufeff') for c in history.columns]
+    omap_path = os.path.join(MODEL_DIR, 'overflow_map.pkl')
+    if os.path.exists(omap_path):
+        with open(omap_path, 'rb') as f:
+            overflow_map = pickle.load(f)
 
 load_resources()
 
@@ -130,11 +135,11 @@ def _build_calendar():
         return res
 
     MIDTERM_SET.update(dr('2025-04-16','2025-04-30') | dr('2026-04-16','2026-04-30'))
-    FINAL_SET.update(dr('2025-06-04','2025-06-17'))
+    FINAL_SET.update(dr('2025-06-04','2025-06-17') | dr('2026-06-08','2026-06-19'))
 
 _build_calendar()
 
-PRE_EXAM_WEEKS = {('2025_1',6),('2026_1',6),('2025_1',13)}
+PRE_EXAM_WEEKS = {('2025_1',6),('2026_1',6),('2025_1',13),('2026_1',13)}
 
 def get_calendar_features(dt: datetime) -> dict:
     key      = dt.strftime('%Y_%m_%d')
@@ -157,6 +162,9 @@ def get_calendar_features(dt: datetime) -> dict:
 KMA_URL = 'https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst'
 KMA_NX, KMA_NY = 57, 119  # 화성시 봉담읍 (수원대 근처)
 
+_weather_cache: dict = {}   # { 'YYYYMMDD': (timestamp, result) }
+WEATHER_CACHE_TTL = 600     # 10분
+
 def _kma_base_time(dt: datetime) -> tuple[str, str]:
     base_hours = [2, 5, 8, 11, 14, 17, 20, 23]
     valid = [t for t in base_hours if t <= dt.hour]
@@ -168,6 +176,11 @@ def _kma_base_time(dt: datetime) -> tuple[str, str]:
 def get_weather(dt: datetime) -> dict:
     fallback = {'temp_avg': 15.0, 'precip_mm': 0.0, 'is_rainy': 0, 'is_cold': 0, 'is_hot': 0}
     date_str = dt.strftime('%Y%m%d')
+    cached = _weather_cache.get(date_str)
+    if cached:
+        ts, result = cached
+        if datetime.now().timestamp() - ts < WEATHER_CACHE_TTL:
+            return result
     try:
         base_date, base_time = _kma_base_time(dt)
         r = requests.get(KMA_URL, params={
@@ -196,13 +209,15 @@ def get_weather(dt: datetime) -> dict:
             raise ValueError('no TMP data')
         t_avg = sum(tmps) / len(tmps)
         precip = sum(pcps)
-        return {
+        result = {
             'temp_avg':  round(t_avg, 1),
             'precip_mm': round(precip, 1),
             'is_rainy':  int(precip > 0.5),
             'is_cold':   int(t_avg < 5),
             'is_hot':    int(t_avg > 28),
         }
+        _weather_cache[date_str] = (datetime.now().timestamp(), result)
+        return result
     except Exception:
         try:
             r2 = requests.get('https://api.open-meteo.com/v1/forecast', params={
@@ -214,29 +229,80 @@ def get_weather(dt: datetime) -> dict:
             d = r2.json()['daily']
             t_avg = ((d['temperature_2m_max'][0] or 15) + (d['temperature_2m_min'][0] or 10)) / 2
             precip = d['precipitation_sum'][0] or 0
-            return {
+            result = {
                 'temp_avg':  round(t_avg, 1),
                 'precip_mm': round(precip, 1),
                 'is_rainy':  int(precip > 0.5),
                 'is_cold':   int(t_avg < 5),
                 'is_hot':    int(t_avg > 28),
             }
+            _weather_cache[date_str] = (datetime.now().timestamp(), result)
+            return result
         except Exception:
             return fallback
 
-# ── 전날 탑승 인원 (lag1) ────────────────────────────────────────────────
-def get_lag1(stop: str, hour: int, dt: datetime) -> float:
-    if history is None:
-        return 0.0
-    yesterday = (dt - timedelta(days=1)).strftime('%Y_%m_%d')
+# ── lag 피처 헬퍼 ────────────────────────────────────────────────────────
+def _prev_weekday(dt: datetime, n: int) -> datetime:
+    """dt 기준으로 주말·공휴일을 건너뛰며 n번째 직전 평일 반환"""
+    d = dt - timedelta(days=1)
+    count = 0
+    while count < n:
+        while d.weekday() >= 5 or d.strftime('%Y_%m_%d') in HOLIDAYS:
+            d -= timedelta(days=1)
+        count += 1
+        if count < n:
+            d -= timedelta(days=1)
+    return d
+
+def _lookup(stop: str, hour: int, date_key: str, fallback_wd: int) -> float:
     rows = history[
         (history['stop'] == stop) &
         (history['hour'] == hour) &
-        (history['date'] == yesterday)
+        (history['date'] == date_key)
     ]
     if len(rows) > 0:
         return float(rows['boardings'].values[0])
-    # 없으면 같은 요일 평균
+    same_wd = history[
+        (history['stop'] == stop) &
+        (history['hour'] == hour) &
+        (history['weekday'] == fallback_wd)
+    ]
+    return float(same_wd['boardings'].mean()) if len(same_wd) > 0 else 0.0
+
+def get_lag1(stop: str, hour: int, dt: datetime) -> float:
+    if history is None:
+        return 0.0
+    prev = _prev_weekday(dt, 1)
+    return _lookup(stop, hour, prev.strftime('%Y_%m_%d'), prev.weekday())
+
+def get_lag7(stop: str, hour: int, dt: datetime) -> float:
+    if history is None:
+        return 0.0
+    # 7일 전 같은 요일 (주말·공휴일이면 직전 평일로)
+    d = dt - timedelta(days=7)
+    while d.weekday() >= 5 or d.strftime('%Y_%m_%d') in HOLIDAYS:
+        d -= timedelta(days=1)
+    return _lookup(stop, hour, d.strftime('%Y_%m_%d'), d.weekday())
+
+def get_roll3(stop: str, hour: int, dt: datetime) -> float:
+    if history is None:
+        return 0.0
+    vals = []
+    d = dt - timedelta(days=1)
+    for _ in range(3):
+        while d.weekday() >= 5 or d.strftime('%Y_%m_%d') in HOLIDAYS:
+            d -= timedelta(days=1)
+        key = d.strftime('%Y_%m_%d')
+        rows = history[
+            (history['stop'] == stop) &
+            (history['hour'] == hour) &
+            (history['date'] == key)
+        ]
+        if len(rows) > 0:
+            vals.append(float(rows['boardings'].values[0]))
+        d -= timedelta(days=1)
+    if vals:
+        return sum(vals) / len(vals)
     same_wd = history[
         (history['stop'] == stop) &
         (history['hour'] == hour) &
@@ -279,24 +345,30 @@ def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> di
     cal     = get_calendar_features(dt)
     weather = get_weather(dt)
     lag1    = get_lag1(stop, hour, dt)
+    lag7    = get_lag7(stop, hour, dt)
+    roll3   = get_roll3(stop, hour, dt)
 
     feats = {
         'hour':    hour,
         'weekday': dt.weekday(),
         **cal,
-        'boardings_lag1': lag1,
+        'boardings_lag1':  lag1,
+        'boardings_lag7':  lag7,
+        'boardings_roll3': roll3,
         **weather,
     }
     X    = pd.DataFrame([{k: feats.get(k, 0) for k in FEATURES}])
     pred = float(model.predict(X)[0])
 
-    # 정류장별 수요 과소추정 보정 (Censored Data 보정)
+    # Censored Data 보정: overflow_map 기반 보정 vs 수동 보정 중 큰 쪽 사용
+    # 수원대입구 15~17시는 overflow 계산 버그(issue2)로 ratio=0 → 수동값 유지
     DEMAND_CORRECTION = {
         ('수원대입구', 15): 2.0,
         ('수원대입구', 16): 2.0,
         ('수원대입구', 17): 2.0,
     }
-    pred *= DEMAND_CORRECTION.get((stop, hour), 1.0)
+    ratio = overflow_map.get(stop, 0.0)
+    pred *= max(1 + ratio, DEMAND_CORRECTION.get((stop, hour), 1.0))
 
     cap    = arrival['capacity'] if arrival else None
     remain = arrival['remainSeat'] if arrival else None
@@ -311,18 +383,28 @@ def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> di
         overflow  = None
 
     # 혼잡도 (잔여석 기준 우선, 없으면 예측값 기준)
-    threshold = (cap or 45) * 0.9
-    base      = remain if remain is not None else pred
-    if base >= threshold or (overflow or 0) > 0:
-        status = '혼잡'
-    elif base >= threshold * 0.6:
-        status = '보통'
+    cap_val = cap or 45
+    if remain is not None:
+        # 잔여석이 적을수록 혼잡
+        if remain <= cap_val * 0.1 or (overflow or 0) > 0:
+            status = '혼잡'
+        elif remain <= cap_val * 0.4:
+            status = '보통'
+        else:
+            status = '여유'
     else:
-        status = '여유'
+        # 예측 대기인원이 많을수록 혼잡
+        threshold = cap_val * 0.9
+        if pred >= threshold or (overflow or 0) > 0:
+            status = '혼잡'
+        elif pred >= threshold * 0.6:
+            status = '보통'
+        else:
+            status = '여유'
 
     return {
         'stop':      stop,
-        'predicted': round(pred, 1),    # ML 예측 수요 (포화 보정 전)
+        'predicted': round(pred, 1),    # ML 예측 수요 (포화 보정 후)
         'can_board': can_board,          # 이번 버스 탑승 가능 인원 (실시간)
         'overflow':  overflow,           # 다음 버스로 넘어가는 인원 (실시간)
         'status':    status,
@@ -337,26 +419,41 @@ def health():
     return {'status': 'ok', 'models': list(models.keys()), 'time': datetime.now().isoformat()}
 
 
-@app.get('/arrival')
-def arrival():
-    result = {}
-    for stop in ALL_STOPS:
-        sid  = STATION_IDS.get(stop)
-        info = fetch_arrival(sid) if sid else None
-        result[stop] = info
-    return result
-
 
 @app.get('/predict')
 def predict(
-    hour: int  = Query(default=None, description='시간대 (7~18)'),
-    date: str  = Query(default=None, description='날짜 YYYY-MM-DD'),
+    hour: int = Query(default=None, ge=0, le=23, description='시간대 (0~23)'),
+    date: str = Query(default=None,             description='날짜 YYYY-MM-DD'),
 ):
-    now  = datetime.now()
-    dt   = datetime.strptime(date, '%Y-%m-%d') if date else now
+    now = datetime.now()
+    if date:
+        try:
+            dt = datetime.strptime(date, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(status_code=400, detail='날짜 형식 오류: YYYY-MM-DD')
+    else:
+        dt = now
     hour = hour if hour is not None else now.hour
 
-    # 실시간 도착정보 병렬 조회
+    cal          = get_calendar_features(dt)
+    is_weekend   = dt.weekday() >= 5
+    is_holiday   = bool(cal['is_holiday'])
+    is_service_day = not is_weekend and not is_holiday
+
+    # 주말·공휴일은 예측 없이 바로 반환
+    if not is_service_day:
+        reason = '공휴일' if is_holiday else '주말'
+        return {
+            'date':           dt.strftime('%Y-%m-%d'),
+            'hour':           hour,
+            'direction':      'arrive' if hour <= 10 else 'depart',
+            'is_service_day': False,
+            'reason':         reason,
+            'stops':          [],
+            'arrivals':       {},
+        }
+
+    # 실시간 도착정보 조회
     arrivals = {}
     for stop in ALL_STOPS:
         sid = STATION_IDS.get(stop)
@@ -368,11 +465,12 @@ def predict(
     results = [predict_stop(s, hour, dt, arrivals.get(s)) for s in stops]
 
     return {
-        'date':      dt.strftime('%Y-%m-%d'),
-        'hour':      hour,
-        'direction': direction,
-        'stops':     results,
-        'arrivals':  arrivals,
+        'date':           dt.strftime('%Y-%m-%d'),
+        'hour':           hour,
+        'direction':      direction,
+        'is_service_day': True,
+        'stops':          results,
+        'arrivals':       arrivals,
     }
 
 

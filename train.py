@@ -23,6 +23,8 @@ FEATURES = [
     'is_pre_exam',
     'is_holiday',
     'boardings_lag1',
+    'boardings_lag7',
+    'boardings_roll3',
     # 날씨
     'temp_avg',
     'precip_mm',
@@ -35,9 +37,10 @@ FEATURES = [
 df = pd.read_csv(DATA_PATH)
 df['year'] = df['date'].str[:4].astype(int)
 
-# lag1 결측치는 같은 stop+hour 평균으로 채움
-df['boardings_lag1'] = df.groupby(['stop','direction','hour'])['boardings_lag1']\
-                         .transform(lambda x: x.fillna(x.mean()))
+# lag 결측치는 같은 stop+hour 평균으로 채움
+for col in ['boardings_lag1', 'boardings_lag7', 'boardings_roll3']:
+    df[col] = df.groupby(['stop','direction','hour'])[col]\
+                .transform(lambda x: x.fillna(x.mean()))
 
 # ── Train / Test 분리 ─────────────────────────────────────────────
 # 시계열 분리: 2025 전체 + 2026 1~6주차 학습, 2026 7~8주차(시험기간 포함) 평가
@@ -55,8 +58,8 @@ print()
 # ── 정류장별 overflow 비율 계산 (train 데이터 기준) ───────────────
 def calc_overflow_ratio(train, stop):
     dep = train[(train['stop'] == stop) & (train['direction'] == 'depart')].copy()
-    dep = dep.sort_values('date').reset_index(drop=True)
-    dep['next_hour_board'] = dep.groupby('hour')['boardings'].shift(-1)
+    dep = dep.sort_values(['date', 'hour']).reset_index(drop=True)
+    dep['next_hour_board'] = dep.groupby('date')['boardings'].shift(-1)
 
     sat = dep[dep['boardings'] >= SAT_THRESH].copy()
     not_sat = dep[dep['boardings'] < SAT_THRESH].copy()
