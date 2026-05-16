@@ -28,18 +28,15 @@
 ```
 [ 학습 파이프라인 ]
 
-해커톤데이터2/*.xlsx ──→ preprocess.py ──→ preprocessed.csv ──┐
-                                                               ├──→ train.py ──→ models/*.pkl
-Open-Meteo API ──────→ collect_weather.py ──→ weather.csv ────┘
+해커톤데이터2/*.xlsx ──→ preprocess.py ──→ preprocessed.csv ──→ train.py ──→ models/*.pkl
 
 
 [ 서비스 파이프라인 ]
 
-기상청 단기예보 API ──────────────────────────────────────────┐
-                                                              ├──→ server.py (FastAPI) ──→ Frontend
-경기도/서울 버스도착정보 API ─────────────────────────────────┤       ↑
-                                                              │  models/*.pkl
-학사 일정 (하드코딩) ─────────────────────────────────────────┘
+기상청 단기예보 API (→ Open-Meteo fallback) ──┐
+경기도 버스도착정보 API ──────────────────────┼──→ server.py (FastAPI) ──→ frontend/index.html
+학사 일정 (하드코딩) ─────────────────────────┤         ↑
+preprocessed.csv (lag 피처 조회) ─────────────┘   models/*.pkl
 ```
 
 ---
@@ -55,50 +52,62 @@ bus-stop/
 │   ├── model_신명아파트.pkl
 │   ├── model_수원대입구.pkl
 │   ├── model_사당역9번출구앞.pkl
-│   └── overflow_map.pkl       # 정류장별 포화 초과 비율
-├── collect_weather.py         # Open-Meteo 날씨 데이터 수집
+│   └── overflow_map.pkl       # 정류장별 포화 초과 비율 (Censored Data 보정용)
+├── frontend/
+│   └── index.html             # Leaflet.js 지도 + 사이드바 UI
 ├── preprocess.py              # 탑승 인원 역산 + 피처 생성
 ├── train.py                   # RandomForest 모델 학습 및 평가
-├── config.py                  # 환경변수 로드 (API 키)
+├── server.py                  # FastAPI 추론 서버
 ├── preprocessed.csv           # 전처리 완료 데이터 (3,552행)
-├── weather.csv                # 날씨 데이터 (426일치)
 ├── .env                       # API 키 (로컬 전용, Git 제외)
 ├── .env.example               # 환경변수 양식
-└── requirements.txt           # 의존성 패키지 (예정)
+└── requirements.txt           # 의존성 패키지
 ```
-
-> 추가 예정: `server.py` (FastAPI), `frontend/` (지도 UI)
 
 ---
 
 ## 모델 성능
 
-| 정류장 | MAE | RMSE | R² |
-|--------|-----|------|----|
-| 사당역9번출구앞 | 10.28명 | 11.92 | **0.442** |
-| 아이파크정문 | 6.65명 | 7.96 | 0.320 |
-| 수원대입구 | 6.09명 | 7.33 | 0.268 |
-| 효행초등학교정문 | 5.70명 | 7.58 | 0.236 |
-| 신명아파트 | 3.00명 | 3.66 | -0.145 |
+| 정류장 | Test MAE | Test RMSE | R² |
+|--------|----------|-----------|-----|
+| 사당역9번출구앞 | 9.34명 | 10.99 | **0.526** |
+| 아이파크정문 | 6.12명 | 7.59 | 0.381 |
+| 수원대입구 | 6.13명 | 7.71 | 0.190 |
+| 효행초등학교정문 | 6.02명 | 8.20 | 0.105 |
+| 신명아파트 | 2.73명 | 3.53 | -0.063 |
 
-- 알고리즘: `RandomForestRegressor (n_estimators=200, max_depth=8)`
+- 알고리즘: `RandomForestRegressor (n_estimators=200, max_depth=8, min_samples_leaf=3)`
 - 학습 기간: 2025 전체 + 2026 1~6주차 (117일)
-- 테스트 기간: 2026 7~8주차 (10일, 시험기간 포함)
-- 주요 피처: `boardings_lag1`(전날 탑승 수), `hour`, `temp_avg`, `week_num`
+- 테스트 기간: 2026 7~8주차 (10일, 중간고사 기간 포함)
+- 주요 피처: `boardings_roll3`(최근 3일 평균), `boardings_lag1`(전날), `boardings_lag7`(1주 전)
+
+> R²가 전반적으로 낮은 이유: 테스트 10일 중 7일이 중간고사(모델이 처음 보는 패턴), 정류장별 탑승 수 변동성이 매우 큼(CV ≈ 1.0), 총 데이터 130일의 구조적 한계.
+
+---
+
+## 학습 피처 (17개)
+
+| 카테고리 | 피처 |
+|---|---|
+| 시간 | `hour`, `weekday` |
+| 학사일정 | `week_num`, `sem_num`, `is_exam`, `is_exam_mid`, `is_exam_fin`, `is_pre_exam`, `is_holiday` |
+| 탑승 이력 | `boardings_lag1` (직전 평일), `boardings_lag7` (1주 전 같은 요일), `boardings_roll3` (최근 3일 평균) |
+| 날씨 | `temp_avg`, `precip_mm`, `is_rainy`, `is_cold`, `is_hot` |
 
 ---
 
 ## 포화 상태 처리
 
-버스가 꽉 찬 경우 못 탄 사람은 데이터에 기록되지 않습니다(Censored Data). 포화 예상 시 구간 표현으로 처리합니다.
+버스가 꽉 찬 경우 못 탄 사람은 데이터에 기록되지 않습니다(Censored Data). `train.py`의 `calc_overflow_ratio()`로 정류장별 초과 수요 비율을 계산하고 `overflow_map.pkl`에 저장합니다. 서버는 이를 로드하여 예측값을 상향 보정합니다.
 
-```python
-# 포화 임계값: 1층 버스 45석 → 43명, 2층 버스 70석 → 68명
-if pred >= CAPACITY * 0.9:
-    return {"low": pred, "high": pred + pred_next * overflow_ratio, "status": "혼잡"}
-else:
-    return {"low": pred, "high": pred, "status": "여유"}
 ```
+보정 배율 = max(1 + overflow_ratio, 수동_보정값)
+# 수원대입구 15~17시: 수동 2.0x (overflow 계산 특성상 수동 보정 유지)
+```
+
+실시간 버스 잔여석(GBIS API)이 있을 때는 추가로:
+- `can_board = min(예측 대기, 잔여석)` → 이번 버스에 탈 수 있는 인원
+- `overflow = max(0, 예측 대기 - 잔여석)` → 다음 버스로 넘어가는 인원
 
 ---
 
@@ -112,28 +121,39 @@ pip install -r requirements.txt
 
 ### 2. API 키 설정
 
-`.env.example`을 복사해서 `.env` 파일을 만들고 발급받은 키를 입력합니다.
-
 ```bash
 cp .env.example .env
+# .env 파일에 공공데이터포털 API 키 입력
 ```
 
-```
-PUBLIC_DATA_API_KEY=여기에_공공데이터포털_키_입력
-```
-
-### 3. 학습 데이터 수집 및 전처리
+### 3. 전처리 및 학습
 
 ```bash
-python collect_weather.py   # 날씨 데이터 수집
-python preprocess.py        # 탑승 데이터 전처리
+python preprocess.py   # preprocessed.csv 생성
+python train.py        # models/*.pkl 생성
 ```
 
-### 4. 모델 학습
+### 4. 서버 실행
 
 ```bash
-python train.py
+uvicorn server:app --host 0.0.0.0 --port 8000
+# 브라우저에서 http://localhost:8000 접속
 ```
+
+외부 접속이 필요한 경우 (Serveo SSH 터널):
+```bash
+ssh -R 80:localhost:8000 serveo.net
+```
+
+---
+
+## API 엔드포인트
+
+| 엔드포인트 | 설명 |
+|---|---|
+| `GET /` | 프론트엔드 (index.html) |
+| `GET /predict?hour=15&date=2026-05-18` | 시간대별 혼잡도 예측 + 실시간 도착정보 |
+| `GET /health` | 서버 상태 및 로드된 모델 확인 |
 
 ---
 
@@ -141,54 +161,18 @@ python train.py
 
 | API | 용도 | 비고 |
 |-----|------|------|
-| Open-Meteo | 과거 날씨 수집 (학습용) | 무료, 키 불필요 |
-| 기상청 단기예보 | 실시간 날씨 (추론 입력값) | 공공데이터포털 |
-| 경기도 버스도착정보 | 수원대 방면 버스 도착 시간 | 공공데이터포털 |
-| 서울시 버스도착정보 | 사당역 방면 버스 도착 시간 | 공공데이터포털 |
+| 기상청 단기예보 | 실시간 날씨 (추론 입력값) | 공공데이터포털, 10분 캐시 |
+| Open-Meteo | 날씨 fallback | 무료, 키 불필요 |
+| 경기도 버스도착정보 (GBIS) | 수원대 방면 실시간 잔여석 | 공공데이터포털 |
 
----
-
-## 남은 작업
-
-- [ ] `server.py` — FastAPI 추론 서버 구현
-- [ ] 기상청 단기예보 API 연동
-- [ ] 버스 도착 정보 API 연동
-- [ ] 프론트엔드 — 카카오맵/네이버맵 + 정류장 마커 + 예측 인원 표시
-- [ ] 발표 자료 작성
-
----
-
-## 성능 개선 계획
-
-| 방법 | 난이도 | 예상 효과 | 상태 |
-|------|--------|-----------|------|
-| `lag7` + `rolling_mean_7` 피처 추가 | 쉬움 | 높음 | 예정 |
-| RandomForest → LightGBM 교체 | 쉬움 | 중간~높음 | 예정 |
-| 신명아파트 모델 → 시간대별 평균 대체 | 쉬움 | 지표 개선 | 예정 |
-| 시험기간 전용 모델 분리 학습 | 중간 | 시험기간 한정 높음 | 데이터 추가 후 |
-
-### 피처 개선 상세
-
-- **`boardings_lag7`**: 저번주 같은 요일 탑승 수 — 주간 반복 패턴 반영
-- **`boardings_rolling7`**: 최근 7일 이동평균 — 단기 추세 반영
-- 현재 `lag1`(전날)만 있어 요일 간 패턴 차이를 놓치고 있음
-
-### 시험기간 데이터 현황
-
-| 구분 | 일수 | 비율 |
-|------|------|------|
-| 일반 기간 | 102일 | 78.5% |
-| 시험기간 | 28일 | 21.5% |
-
-> 시험기간 데이터를 추가 확보할수록 시험기간 예측 정확도가 올라갑니다.
-> 2026년 기말고사(6월) 데이터 수집 후 재학습 예정.
+> 사당역9번출구앞은 서울시 정류장(stationId: 119000302)이라 경기도 GBIS API로 조회 불가, 실시간 도착정보 없음.
 
 ---
 
 ## 주요 한계점
 
-1. **실시간 대기 인원 없음** — 과거 패턴 기반 예측에 한정
-2. **재차인원 = 시간대 최대값** — 정류장 간 역산 시 오차 가능성
-3. **포화 수요 과소추정** — 못 탄 사람은 데이터에 미포함
-4. **버스 차종 미기록** — 45석/70석 구분 불가
-5. **시험기간 데이터 부족** — 28일(21.5%)로 정확도 제한
+1. **데이터 130일** — 데이터가 더 쌓일수록 모델 정확도 향상
+2. **포화 수요 과소추정** — 못 탄 사람은 데이터에 미포함 (overflow_map으로 보정 중)
+3. **사당역 실시간 정보 없음** — 서울시 버스 API 별도 연동 필요
+4. **주말·공휴일 예측 없음** — 7790 버스 운행 특성상 평일 전용 서비스
+5. **2학기 데이터 14일** — 2학기 패턴 예측 신뢰도 낮음
