@@ -290,6 +290,14 @@ def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> di
     X    = pd.DataFrame([{k: feats.get(k, 0) for k in FEATURES}])
     pred = float(model.predict(X)[0])
 
+    # 정류장별 수요 과소추정 보정 (Censored Data 보정)
+    DEMAND_CORRECTION = {
+        ('수원대입구', 15): 2.0,
+        ('수원대입구', 16): 2.0,
+        ('수원대입구', 17): 2.0,
+    }
+    pred *= DEMAND_CORRECTION.get((stop, hour), 1.0)
+
     cap    = arrival['capacity'] if arrival else None
     remain = arrival['remainSeat'] if arrival else None
     pred   = max(0, pred)
