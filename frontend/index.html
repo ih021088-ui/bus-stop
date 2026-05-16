@@ -86,6 +86,8 @@
         .badge-여유 { background: #e8f5e9; color: #2e7d32; }
         .badge-보통 { background: #fff3e0; color: #e65100; }
         .badge-혼잡 { background: #ffebee; color: #c62828; }
+        .stop-card-inactive { opacity: 0.4; pointer-events: none; }
+        .stop-card-inactive .stop-name { color: #888; }
 
         .arrival-info {
             margin-top: 6px;
@@ -120,6 +122,22 @@
         /* Leaflet 마커 컨테이너가 내용을 clip하지 않도록 */
         .leaflet-marker-icon { overflow: visible; }
         .leaflet-div-icon { background: none; border: none; }
+
+        /* 모바일 대응 */
+        @media (max-width: 640px) {
+            header { padding: 8px 14px; }
+            header h1 { font-size: 15px; }
+            #weather-info { display: none !important; }
+            .main { flex-direction: column; }
+            #map { flex: none; height: 42vh; }
+            .sidebar {
+                width: 100%;
+                height: 58vh;
+                border-left: none;
+                border-top: 1px solid #e0e0e0;
+            }
+            .stop-card { padding: 10px 14px; }
+        }
     </style>
 </head>
 <body>
@@ -208,7 +226,7 @@ function getCongestion(boardings) {
 }
 
 function getColor(congestion) {
-    return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion];
+    return { '혼잡': '#e53935', '보통': '#fb8c00', '여유': '#43a047' }[congestion] || '#9e9e9e';
 }
 
 // ── 도착정보 변환 (서버 arrivals → {minutes, seats}) ─────────────────
@@ -216,7 +234,11 @@ function parseArrivals(raw) {
     const result = {};
     for (const [name, info] of Object.entries(raw || {})) {
         if (!info) { result[name] = null; continue; }
-        result[name] = { minutes: info.predictMin, seats: info.remainSeat };
+        result[name] = {
+            minutes:    info.predictMin,
+            seats:      info.remainSeat,
+            nextBusMin: info.nextBusMin ?? null,
+        };
     }
     return result;
 }
@@ -267,7 +289,9 @@ function createMarker(stop, boardings, status, arrival, can_board, overflow) {
     if (can_board !== null && can_board !== undefined) {
         demandLine = `<div style="font-size:13px; color:#555;">이번 버스 <b style="color:#222;">${can_board}명</b> 탑승 가능</div>`;
         if (overflow > 0) {
-            demandLine += `<div style="font-size:12px; color:#c62828; margin-top:2px;">⚠️ 약 <b>${overflow}명</b>은 다음 버스</div>`;
+            const nextMin = arrival?.nextBusMin;
+            const nextTxt = nextMin != null ? ` · 다음 버스 ${nextMin}분 후` : '';
+            demandLine += `<div style="font-size:12px; color:#c62828; margin-top:2px;">⚠️ 약 <b>${overflow}명</b>은 다음 버스${nextTxt}</div>`;
         }
     } else {
         demandLine = `<div style="font-size:13px; color:#555;">예상 대기 인원: <b style="color:#222;">${boardings}명</b></div>`;
@@ -290,6 +314,15 @@ function createMarker(stop, boardings, status, arrival, can_board, overflow) {
 
 // ── 사이드바 카드 렌더링 ──────────────────────────────────────────────
 function renderCard(containerId, stop, info, status, arrival) {
+    if (info === null) {
+        const card = document.createElement('div');
+        card.className = 'stop-card stop-card-inactive';
+        card.innerHTML = `
+            <div class="stop-name">${stop.name}</div>
+            <div class="stop-meta" style="font-size:12px; color:#aaa;">이 시간대 운행 없음</div>`;
+        document.getElementById(containerId).appendChild(card);
+        return;
+    }
     const congestion = status || getCongestion(info.predicted || 0);
     const arrTxt = arrivalText(arrival);
     const card = document.createElement('div');
@@ -299,7 +332,9 @@ function renderCard(containerId, stop, info, status, arrival) {
     if (info.can_board !== null && info.can_board !== undefined) {
         demandHtml = `<span class="boarding">이번 버스 <b>${info.can_board}명</b> 탑승 가능</span>`;
         if (info.overflow > 0) {
-            demandHtml += `<div style="font-size:12px; color:#c62828; margin-top:3px;">⚠️ 약 <b>${info.overflow}명</b>은 다음 버스</div>`;
+            const nextMin = arrival?.nextBusMin;
+            const nextTxt = nextMin != null ? ` · 다음 버스 ${nextMin}분 후` : '';
+            demandHtml += `<div style="font-size:12px; color:#c62828; margin-top:3px;">⚠️ 약 <b>${info.overflow}명</b>은 다음 버스${nextTxt}</div>`;
         }
     } else {
         demandHtml = `<span class="boarding">예상 대기 <b>${Math.round(info.predicted || 0)}명</b></span>`;
@@ -426,7 +461,19 @@ function showNotServiceDay(reason) {
     });
 }
 
+let isRefreshing = false;
+
 async function refreshData() {
+    if (isRefreshing) return;
+    isRefreshing = true;
+    try {
+        await _doRefresh();
+    } finally {
+        isRefreshing = false;
+    }
+}
+
+async function _doRefresh() {
     const hour = parseInt(document.getElementById('hour-select').value);
     const { isServiceDay, direction, reason, stops, arrivals } = await fetchData(hour);
 
@@ -451,17 +498,17 @@ async function refreshData() {
     STOPS.depart.forEach(stop => {
         const info = isArrive ? null : (stops[stop.name] ?? null);
         const boardings = info ? Math.round(info.predicted || 0) : 0;
-        const status = info ? info.status : null;
+        const status = info ? info.status : '운행외';
         createMarker(stop, boardings, status, arrivals[stop.name] ?? null, info?.can_board, info?.overflow);
-        renderCard('depart-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name] ?? null);
+        renderCard('depart-stops', stop, info, status, arrivals[stop.name] ?? null);
     });
 
     STOPS.arrive.forEach(stop => {
         const info = isArrive ? (stops[stop.name] ?? null) : null;
         const boardings = info ? Math.round(info.predicted || 0) : 0;
-        const status = info ? info.status : null;
+        const status = info ? info.status : '운행외';
         createMarker(stop, boardings, status, arrivals[stop.name] ?? null, info?.can_board, info?.overflow);
-        renderCard('arrive-stops', stop, info || { predicted: 0 }, status, arrivals[stop.name] ?? null);
+        renderCard('arrive-stops', stop, info, status, arrivals[stop.name] ?? null);
     });
 }
 
@@ -482,8 +529,17 @@ function setDefaultHour() {
     document.getElementById('hour-select').value = closest;
 }
 
-// ── 도착정보 30초마다 자동 갱신 ──────────────────────────────────────
-setInterval(refreshData, 30000);
+// ── 자동 갱신 (비활성 탭에서는 중지) ────────────────────────────────
+let refreshInterval = setInterval(refreshData, 30000);
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearInterval(refreshInterval);
+    } else {
+        refreshData();
+        refreshInterval = setInterval(refreshData, 30000);
+    }
+});
 
 // ── 초기 실행 ─────────────────────────────────────────────────────────
 setDefaultHour();

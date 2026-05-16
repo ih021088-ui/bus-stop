@@ -2,7 +2,11 @@ import pandas as pd
 import numpy as np
 import glob
 import os
+import requests
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── 정류장 순번 매핑 ──────────────────────────────────────────────
 STOP_SEQ = {
@@ -110,7 +114,6 @@ def parse_file(filepath, week_map, semester_map, midterm_set, final_set):
     # 컬럼명 정규화 (파일마다 약간 다를 수 있음)
     cols = list(df.columns)
     seq_col = cols[2]   # 순번
-    name_col = cols[3]  # 정류장명
 
     # 날짜 피처
     dt = datetime.strptime(date_str, '%Y_%m_%d')
@@ -207,6 +210,111 @@ def parse_file(filepath, week_map, semester_map, midterm_set, final_set):
     return rows
 
 
+# ── 기상청 ASOS 일 관측자료 조회 (수원 관측소 119번) ──────────────
+ASOS_URL  = 'http://apis.data.go.kr/1360000/AsosDalyInfoService/getWthrDataList'
+ASOS_STN  = 119   # 수원 지상관측소
+
+def _parse_weather_row(r):
+    """ASOS 응답 한 행 → (date_key, dict) or None"""
+    dt = r.get('tm', '')              # 'YYYY-MM-DD'
+    if not dt or len(dt) < 10:
+        return None
+    temp   = float(r.get('avgTa') or 15.0)
+    precip = float(r.get('sumRn') or 0.0)
+    key    = dt[:10].replace('-', '_')
+    return key, {
+        'temp_avg':  round(temp,   1),
+        'precip_mm': round(precip, 1),
+        'is_rainy':  int(precip >= 0.5),
+        'is_cold':   int(temp    <  5.0),
+        'is_hot':    int(temp    > 28.0),
+    }
+
+def _fetch_weather_kma(start_dt, end_dt, api_key):
+    """기상청 ASOS API → {date_key: weather_dict}"""
+    params = {
+        'serviceKey': api_key,
+        'pageNo':    1,
+        'numOfRows': 999,
+        'dataType':  'JSON',
+        'dataCd':    'ASOS',
+        'dateCd':    'DAY',
+        'startDt':   start_dt.replace('-', ''),   # YYYYMMDD
+        'endDt':     end_dt.replace('-', ''),
+        'stnIds':    ASOS_STN,
+    }
+    resp = requests.get(ASOS_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    body = resp.json()['response']['body']
+    items = body.get('items', {}).get('item', [])
+    result = {}
+    for row in items:
+        parsed = _parse_weather_row(row)
+        if parsed:
+            result[parsed[0]] = parsed[1]
+    return result
+
+def _fetch_weather_openmeteo(start_dt, end_dt):
+    """Open-Meteo 역사 API fallback → {date_key: weather_dict}"""
+    url = (
+        'https://archive-api.open-meteo.com/v1/archive'
+        f'?latitude=37.25&longitude=126.97'
+        f'&start_date={start_dt}&end_date={end_dt}'
+        '&daily=temperature_2m_mean,precipitation_sum'
+        '&timezone=Asia%2FSeoul'
+    )
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()['daily']
+    result = {}
+    for d, temp, precip in zip(
+        data['time'],
+        data['temperature_2m_mean'],
+        data['precipitation_sum'],
+    ):
+        temp   = float(temp   or 15.0)
+        precip = float(precip or 0.0)
+        result[d.replace('-', '_')] = {
+            'temp_avg':  round(temp,   1),
+            'precip_mm': round(precip, 1),
+            'is_rainy':  int(precip >= 0.5),
+            'is_cold':   int(temp    <  5.0),
+            'is_hot':    int(temp    > 28.0),
+        }
+    return result
+
+def fetch_weather(date_keys):
+    """YYYY_MM_DD 날짜 목록 → {date_key: weather_dict}
+    기상청 ASOS API 우선, 실패 시 Open-Meteo fallback.
+    """
+    api_key = os.environ.get('PUBLIC_DATA_API_KEY', '')
+
+    valid  = sorted(d.replace('_', '-') for d in date_keys if len(d) == 10)
+    if not valid:
+        return {}
+    start_dt, end_dt = valid[0], valid[-1]
+
+    if api_key:
+        try:
+            result = _fetch_weather_kma(start_dt, end_dt, api_key)
+            if result:
+                print(f'  기상청 ASOS: {len(result)}일 조회 완료')
+                return result
+            print('  [경고] 기상청 ASOS 응답 비어 있음 → Open-Meteo fallback')
+        except Exception as e:
+            print(f'  [경고] 기상청 ASOS 실패: {e} → Open-Meteo fallback')
+    else:
+        print('  [경고] PUBLIC_DATA_API_KEY 없음 → Open-Meteo fallback')
+
+    try:
+        result = _fetch_weather_openmeteo(start_dt, end_dt)
+        print(f'  Open-Meteo: {len(result)}일 조회 완료')
+        return result
+    except Exception as e:
+        print(f'  [경고] Open-Meteo도 실패: {e} → 기본값 사용')
+        return {}
+
+
 # ── 전체 파일 처리 ────────────────────────────────────────────────
 def build_dataset(data_dir='./해커톤데이터2'):
     week_map, semester_map = build_week_map()
@@ -222,13 +330,29 @@ def build_dataset(data_dir='./해커톤데이터2'):
 
     df = df.sort_values(['stop', 'direction', 'hour', 'date']).reset_index(drop=True)
 
-    grp = df.groupby(['stop', 'direction', 'hour'])['boardings']
-    # lag1: 직전 평일 (shift(1))
-    df['boardings_lag1']  = grp.shift(1)
-    # lag7: 약 1주 전 같은 요일 (평일 기준 shift(5))
-    df['boardings_lag7']  = grp.shift(5)
-    # roll3: 직전 3 평일 탑승 수 평균
-    df['boardings_roll3'] = grp.transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+    # lag 계산은 휴일 행을 제외하고 수행 (서버의 _prev_weekday와 일치)
+    df_work = df[df['is_holiday'] == 0].copy()
+    grp = df_work.groupby(['stop', 'direction', 'hour'])['boardings']
+    # lag1: 직전 운행일 (shift(1))
+    df_work['boardings_lag1']  = grp.shift(1)
+    # lag7: 약 1주 전 같은 요일 (운행일 기준 shift(5))
+    df_work['boardings_lag7']  = grp.shift(5)
+    # roll3: 직전 3 운행일 평균
+    df_work['boardings_roll3'] = grp.transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean())
+
+    df = df.merge(
+        df_work[['date', 'stop', 'direction', 'hour',
+                 'boardings_lag1', 'boardings_lag7', 'boardings_roll3']],
+        on=['date', 'stop', 'direction', 'hour'],
+        how='left',
+    )
+
+    # ── 날씨 컬럼 추가 (Open-Meteo 역사 API) ──────────────────────
+    print('날씨 데이터 조회 중...')
+    weather = fetch_weather(df['date'].unique().tolist())
+    WEATHER_DEFAULTS = {'temp_avg': 15.0, 'precip_mm': 0.0, 'is_rainy': 0, 'is_cold': 0, 'is_hot': 0}
+    for col, default in WEATHER_DEFAULTS.items():
+        df[col] = df['date'].map(lambda d, c=col: weather.get(d, {}).get(c, default))
 
     return df
 

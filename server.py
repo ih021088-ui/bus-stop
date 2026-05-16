@@ -72,9 +72,11 @@ MODEL_DIR = './models'
 models: dict = {}
 history: pd.DataFrame | None = None
 overflow_map: dict = {}
+_hist_dict: dict = {}   # (stop, hour, date) -> boardings  \u2014 O(1) \uc870\ud68c\uc6a9
+_hist_wd: dict   = {}   # (stop, hour, weekday) -> [boardings]
 
 def load_resources():
-    global models, history, overflow_map
+    global models, history, overflow_map, _hist_dict, _hist_wd
     for stop in ALL_STOPS:
         path = os.path.join(MODEL_DIR, f'model_{stop}.pkl')
         if os.path.exists(path):
@@ -83,6 +85,11 @@ def load_resources():
     if os.path.exists('./preprocessed.csv'):
         history = pd.read_csv('./preprocessed.csv')
         history.columns = [c.lstrip('\ufeff') for c in history.columns]
+        for _, row in history.iterrows():
+            k = (row['stop'], int(row['hour']), row['date'])
+            _hist_dict[k] = row['boardings']
+            wk = (row['stop'], int(row['hour']), int(row['weekday']))
+            _hist_wd.setdefault(wk, []).append(row['boardings'])
     omap_path = os.path.join(MODEL_DIR, 'overflow_map.pkl')
     if os.path.exists(omap_path):
         with open(omap_path, 'rb') as f:
@@ -255,60 +262,43 @@ def _prev_weekday(dt: datetime, n: int) -> datetime:
     return d
 
 def _lookup(stop: str, hour: int, date_key: str, fallback_wd: int) -> float:
-    rows = history[
-        (history['stop'] == stop) &
-        (history['hour'] == hour) &
-        (history['date'] == date_key)
-    ]
-    if len(rows) > 0:
-        return float(rows['boardings'].values[0])
-    same_wd = history[
-        (history['stop'] == stop) &
-        (history['hour'] == hour) &
-        (history['weekday'] == fallback_wd)
-    ]
-    return float(same_wd['boardings'].mean()) if len(same_wd) > 0 else 0.0
+    val = _hist_dict.get((stop, hour, date_key))
+    if val is not None:
+        return float(val)
+    wd_vals = _hist_wd.get((stop, hour, fallback_wd), [])
+    return sum(wd_vals) / len(wd_vals) if wd_vals else 0.0
 
 def get_lag1(stop: str, hour: int, dt: datetime) -> float:
-    if history is None:
+    if not _hist_dict:
         return 0.0
     prev = _prev_weekday(dt, 1)
     return _lookup(stop, hour, prev.strftime('%Y_%m_%d'), prev.weekday())
 
 def get_lag7(stop: str, hour: int, dt: datetime) -> float:
-    if history is None:
+    """preprocess.py의 shift(5)와 동일: 5 이전 평일 (주말·공휴일 제외)"""
+    if not _hist_dict:
         return 0.0
-    # 7일 전 같은 요일 (주말·공휴일이면 직전 평일로)
-    d = dt - timedelta(days=7)
-    while d.weekday() >= 5 or d.strftime('%Y_%m_%d') in HOLIDAYS:
-        d -= timedelta(days=1)
-    return _lookup(stop, hour, d.strftime('%Y_%m_%d'), d.weekday())
+    prev = _prev_weekday(dt, 5)
+    return _lookup(stop, hour, prev.strftime('%Y_%m_%d'), prev.weekday())
 
 def get_roll3(stop: str, hour: int, dt: datetime) -> float:
-    if history is None:
+    if not _hist_dict:
         return 0.0
     vals = []
     d = dt - timedelta(days=1)
     for _ in range(3):
         while d.weekday() >= 5 or d.strftime('%Y_%m_%d') in HOLIDAYS:
             d -= timedelta(days=1)
-        key = d.strftime('%Y_%m_%d')
-        rows = history[
-            (history['stop'] == stop) &
-            (history['hour'] == hour) &
-            (history['date'] == key)
-        ]
-        if len(rows) > 0:
-            vals.append(float(rows['boardings'].values[0]))
+        val = _hist_dict.get((stop, hour, d.strftime('%Y_%m_%d')))
+        if val is not None:
+            vals.append(float(val))
         d -= timedelta(days=1)
     if vals:
         return sum(vals) / len(vals)
-    same_wd = history[
-        (history['stop'] == stop) &
-        (history['hour'] == hour) &
-        (history['weekday'] == dt.weekday())
-    ]
-    return float(same_wd['boardings'].mean()) if len(same_wd) > 0 else 0.0
+    # 폴백: 직전 평일 요일의 과거 평균
+    prev = _prev_weekday(dt, 1)
+    wd_vals = _hist_wd.get((stop, hour, prev.weekday()), [])
+    return sum(wd_vals) / len(wd_vals) if wd_vals else 0.0
 
 # ── GBIS 버스 도착정보 ────────────────────────────────────────────────────
 def fetch_arrival(station_id: str) -> dict | None:
@@ -319,22 +309,27 @@ def fetch_arrival(station_id: str) -> dict | None:
             items = [items]
         for item in items:
             if item.get('routeId') == ROUTE_ID and item.get('vehId1'):
-                low  = int(item.get('lowPlate1', 0) or 0)
-                rem  = item.get('remainSeatCnt1', -1)
-                rem  = int(rem) if str(rem).lstrip('-').isdigit() else -1
-                cap  = CAPACITY.get(low, 45)
-                pred = item.get('predictTime1', '')
+                low   = int(item.get('lowPlate1', 0) or 0)
+                rem   = item.get('remainSeatCnt1', -1)
+                rem   = int(rem) if str(rem).lstrip('-').isdigit() else -1
+                cap   = CAPACITY.get(low, 45)
+                pred  = item.get('predictTime1', '')
+                pred2 = item.get('predictTime2', '')
                 return {
                     'plateNo':    str(item.get('plateNo1', '')).strip(),
                     'busType':    low,
                     'capacity':   cap,
                     'remainSeat': rem if rem >= 0 else None,
                     'passengers': cap - rem if rem >= 0 else None,
-                    'predictMin': int(pred) if str(pred).isdigit() else None,
+                    'predictMin': int(pred)  if str(pred).isdigit()  else None,
+                    'nextBusMin': int(pred2) if str(pred2).isdigit() else None,
                 }
     except Exception:
         pass
     return None
+
+# R² < 0인 정류장: ML 모델 대신 학사 컨텍스트 반영 과거 평균 사용
+POOR_PERFORMANCE_STOPS = {'신명아파트'}
 
 # ── 예측 함수 ─────────────────────────────────────────────────────────────
 def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> dict:
@@ -348,17 +343,30 @@ def predict_stop(stop: str, hour: int, dt: datetime, arrival: dict | None) -> di
     lag7    = get_lag7(stop, hour, dt)
     roll3   = get_roll3(stop, hour, dt)
 
-    feats = {
-        'hour':    hour,
-        'weekday': dt.weekday(),
-        **cal,
-        'boardings_lag1':  lag1,
-        'boardings_lag7':  lag7,
-        'boardings_roll3': roll3,
-        **weather,
-    }
-    X    = pd.DataFrame([{k: feats.get(k, 0) for k in FEATURES}])
-    pred = float(model.predict(X)[0])
+    if stop in POOR_PERFORMANCE_STOPS and history is not None:
+        # 시험기간·요일 필터링한 과거 평균 (R²<0 정류장)
+        mask = (
+            (history['stop'] == stop) &
+            (history['hour'] == hour) &
+            (history['weekday'] == dt.weekday()) &
+            (history['is_exam'] == cal['is_exam'])
+        )
+        rows = history[mask]
+        if len(rows) < 3:
+            rows = history[(history['stop'] == stop) & (history['hour'] == hour)]
+        pred = max(0.0, float(rows['boardings'].mean())) if len(rows) > 0 else 0.0
+    else:
+        feats = {
+            'hour':    hour,
+            'weekday': dt.weekday(),
+            **cal,
+            'boardings_lag1':  lag1,
+            'boardings_lag7':  lag7,
+            'boardings_roll3': roll3,
+            **weather,
+        }
+        X    = pd.DataFrame([{k: feats.get(k, 0) for k in FEATURES}])
+        pred = float(model.predict(X)[0])
 
     # Censored Data 보정: overflow_map 기반 보정 vs 수동 보정 중 큰 쪽 사용
     # 수원대입구 15~17시는 overflow 계산 버그(issue2)로 ratio=0 → 수동값 유지
@@ -453,14 +461,14 @@ def predict(
             'arrivals':       {},
         }
 
-    # 실시간 도착정보 조회
-    arrivals = {}
-    for stop in ALL_STOPS:
-        sid = STATION_IDS.get(stop)
-        arrivals[stop] = fetch_arrival(sid) if sid else None
-
     direction = 'arrive' if hour <= 10 else 'depart'
     stops     = [ARRIVE_STOP] if direction == 'arrive' else DEPART_STOPS
+
+    # 실시간 도착정보 조회 (해당 방향 정류장만)
+    arrivals = {s: None for s in ALL_STOPS}
+    for stop in stops:
+        sid = STATION_IDS.get(stop)
+        arrivals[stop] = fetch_arrival(sid) if sid else None
 
     results = [predict_stop(s, hour, dt, arrivals.get(s)) for s in stops]
 

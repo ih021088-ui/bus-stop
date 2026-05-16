@@ -85,7 +85,7 @@ def train_model(train, test, stop, direction):
 
     if len(tr) < 10:
         print(f'  [{stop}] 학습 데이터 부족 ({len(tr)}개) - 스킵')
-        return None, None
+        return None, None, None
 
     X_tr, y_tr = tr[FEATURES], tr['boardings']
     X_te, y_te = te[FEATURES], te['boardings']
