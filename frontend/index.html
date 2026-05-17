@@ -238,17 +238,27 @@ function parseArrivals(raw) {
             minutes:    info.predictMin,
             seats:      info.remainSeat,
             nextBusMin: info.nextBusMin ?? null,
+            busType:    info.busType ?? null,
+            capacity:   info.capacity ?? null,
         };
     }
     return result;
 }
 
 // ── 도착정보 텍스트 ───────────────────────────────────────────────────
+function busTypeLabel(info) {
+    if (!info || info.busType == null) return '';
+    if (info.busType === 2) return '2층버스 · ';
+    if (info.capacity === 45) return '1층버스 · ';
+    return '';
+}
+
 function arrivalText(info) {
     if (!info || info.minutes == null) return null;
+    const type = busTypeLabel(info);
     const time = info.minutes <= 1 ? '곧 도착' : `${info.minutes}분 후 도착`;
     const seats = info.seats != null ? ` · 잔여 ${info.seats}석` : '';
-    return time + seats;
+    return type + time + seats;
 }
 
 // ── 마커 생성 (Leaflet divIcon) ──────────────────────────────────────

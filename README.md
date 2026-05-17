@@ -45,7 +45,7 @@ preprocessed.csv (lag 피처 조회) ─────────────┘ 
 
 ```
 bus-stop/
-├── 해커톤데이터2/              # 원본 탑승 데이터 (xlsx 130개, 2025-03 ~ 2026-04)
+├── 해커톤데이터2/              # 원본 탑승 데이터 (xlsx, 2025-03 ~ 현재, 실시간 누적 중)
 ├── models/                    # 학습된 모델
 │   ├── model_효행초등학교정문.pkl
 │   ├── model_아이파크정문.pkl
@@ -55,10 +55,22 @@ bus-stop/
 │   └── overflow_map.pkl       # 정류장별 포화 초과 비율 (Censored Data 보정용)
 ├── frontend/
 │   └── index.html             # Leaflet.js 지도 + 사이드바 UI
-├── preprocess.py              # 탑승 인원 역산 + 피처 생성
-├── train.py                   # RandomForest 모델 학습 및 평가
-├── server.py                  # FastAPI 추론 서버
-├── preprocessed.csv           # 전처리 완료 데이터 (3,552행)
+│
+├── [실시간 데이터 수집 — 매일 자동 실행 중]
+├── collect_seats.py           # GBIS API로 정류장별 잔여석 실시간 수집 → seat_log.csv
+├── collect_weather.py         # 기상청/Open-Meteo로 날씨 수집 → weather.csv
+│
+├── [학습 파이프라인]
+├── config.py                  # API 키·경로 등 공통 설정
+├── preprocess.py              # 탑승 인원 역산 + 피처 생성 → preprocessed.csv
+├── train.py                   # RandomForest 모델 학습 및 평가 → models/*.pkl
+├── predict_hybrid.py          # 하이브리드 예측기 (RF + 실시간 만차 보정)
+│
+├── [서비스]
+├── server.py                  # FastAPI 추론 서버 (포트 8000)
+│
+├── preprocessed.csv           # 전처리 완료 데이터 (실시간 누적)
+├── weather.csv                # 수집된 날씨 데이터
 ├── .env                       # API 키 (로컬 전용, Git 제외)
 ├── .env.example               # 환경변수 양식
 └── requirements.txt           # 의존성 패키지
@@ -136,13 +148,31 @@ python train.py        # models/*.pkl 생성
 ### 4. 서버 실행
 
 ```bash
+python server.py
+# 또는
 uvicorn server:app --host 0.0.0.0 --port 8000
-# 브라우저에서 http://localhost:8000 접속
 ```
 
-외부 접속이 필요한 경우 (Serveo SSH 터널):
+#### 외부에서 접속하기 (JupyterHub 등 로컬 접속 불가 환경)
+
+**방법 1 — Cloudflare Tunnel (권장)**
+
+```bash
+nohup cloudflared tunnel --url http://localhost:8000 > /tmp/cloudflared.log 2>&1 &
+# 잠시 후 로그에서 공개 URL 확인
+cat /tmp/cloudflared.log | grep trycloudflare.com
+```
+
+출력 예시:
+```
+https://das-dover-latinas-poker.trycloudflare.com
+```
+
+**방법 2 — Serveo SSH 터널**
+
 ```bash
 ssh -R 80:localhost:8000 serveo.net
+# 출력된 URL로 접속 (예: https://xxxx.serveo.net)
 ```
 
 ---
