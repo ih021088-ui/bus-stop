@@ -24,8 +24,10 @@ API_KEY   = unquote(os.environ.get(
     'PUBLIC_DATA_API_KEY',
     'J1NNfn5UJ4zegGKBELL2lGTySAkSdNuFdugnZ0Pf5/e2OsLWJOSJOEeSiQObz15Ns1opof3iEqWhwbhTAg5U4A=='
 ))
-GBIS_URL  = 'https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2'
-ROUTE_ID  = '200000149'   # 7790 경기버스
+GBIS_URL   = 'https://apis.data.go.kr/6410000/busarrivalservice/v2/getBusArrivalListv2'
+SEOUL_URL  = 'http://ws.bus.go.kr/api/rest/stationinfo/getStationByUid'
+ROUTE_ID   = '200000149'   # 7790 경기버스
+SEOUL_ARS  = {'사당역9번출구앞': '20253'}  # 서울 버스 ARS 번호
 
 DEPART_STOPS = ['효행초등학교정문', '아이파크정문', '신명아파트', '수원대입구']
 ARRIVE_STOP  = '사당역9번출구앞'
@@ -300,7 +302,7 @@ def get_roll3(stop: str, hour: int, dt: datetime) -> float:
     wd_vals = _hist_wd.get((stop, hour, prev.weekday()), [])
     return sum(wd_vals) / len(wd_vals) if wd_vals else 0.0
 
-# ── GBIS 버스 도착정보 ────────────────────────────────────────────────────
+# ── GBIS 버스 도착정보 (경기도 정류장) ───────────────────────────────────
 def fetch_arrival(station_id: str) -> dict | None:
     try:
         r = requests.get(GBIS_URL, params={'serviceKey': API_KEY, 'stationId': station_id}, timeout=8)
@@ -323,6 +325,40 @@ def fetch_arrival(station_id: str) -> dict | None:
                     'passengers': cap - rem if rem >= 0 else None,
                     'predictMin': int(pred)  if str(pred).isdigit()  else None,
                     'nextBusMin': int(pred2) if str(pred2).isdigit() else None,
+                }
+    except Exception:
+        pass
+    return None
+
+# ── 서울 버스 도착정보 (사당역9번출구앞) ─────────────────────────────────
+def fetch_arrival_seoul(ars_id: str) -> dict | None:
+    try:
+        r = requests.get(SEOUL_URL, params={
+            'ServiceKey': API_KEY,
+            'arsId': ars_id,
+            'resultType': 'json',
+        }, timeout=8)
+        items = r.json().get('msgBody', {}).get('itemList', [])
+        for item in items:
+            if str(item.get('busRouteId', '')) == ROUTE_ID and item.get('vehId1'):
+                low   = int(item.get('busType1', 0) or 0)
+                cap   = CAPACITY.get(low, 45)
+                # traTime1: 초 단위 → 분으로 변환
+                sec1  = item.get('traTime1', '')
+                sec2  = item.get('traTime2', '')
+                pred  = round(int(sec1) / 60) if str(sec1).isdigit() else None
+                pred2 = round(int(sec2) / 60) if str(sec2).isdigit() else None
+                # remndrNmpr1: 잔여좌석수 (0이면 미제공으로 처리)
+                rem   = item.get('remndrNmpr1', '0')
+                rem   = int(rem) if str(rem).isdigit() and int(rem) > 0 else None
+                return {
+                    'plateNo':    str(item.get('plainNo1', '') or '').strip(),
+                    'busType':    low,
+                    'capacity':   cap,
+                    'remainSeat': rem,
+                    'passengers': cap - rem if rem is not None else None,
+                    'predictMin': pred,
+                    'nextBusMin': pred2,
                 }
     except Exception:
         pass
@@ -467,8 +503,11 @@ def predict(
     # 실시간 도착정보 조회 (해당 방향 정류장만)
     arrivals = {s: None for s in ALL_STOPS}
     for stop in stops:
-        sid = STATION_IDS.get(stop)
-        arrivals[stop] = fetch_arrival(sid) if sid else None
+        if stop in SEOUL_ARS:
+            arrivals[stop] = fetch_arrival_seoul(SEOUL_ARS[stop])
+        else:
+            sid = STATION_IDS.get(stop)
+            arrivals[stop] = fetch_arrival(sid) if sid else None
 
     results = [predict_stop(s, hour, dt, arrivals.get(s)) for s in stops]
 
